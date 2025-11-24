@@ -83,12 +83,12 @@ jobs:
       # ==========================================
       - name: Pull official Docker images
         run: |
-          docker pull ghcr.io/mendableai/firecrawl:latest
-          docker pull ghcr.io/mendableai/firecrawl-playwright:latest
+          docker pull ghcr.io/firecrawl/firecrawl:latest
+          docker pull ghcr.io/firecrawl/playwright-service:latest
 
           # Tag para nosso padrão
-          docker tag ghcr.io/mendableai/firecrawl:latest firecrawl-api:latest
-          docker tag ghcr.io/mendableai/firecrawl-playwright:latest firecrawl-playwright:latest
+          docker tag ghcr.io/firecrawl/firecrawl:latest firecrawl-api:latest
+          docker tag ghcr.io/firecrawl/playwright-service:latest firecrawl-playwright:latest
 
       - name: Build NUQ Postgres Docker image
         run: |
