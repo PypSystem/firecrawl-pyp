@@ -181,6 +181,11 @@ jobs:
             docker load < firecrawl-playwright.tar.gz
             docker load < firecrawl-nuq-postgres.tar.gz
 
+            # Re-tag imagens (docker load pode restaurar com nome original)
+            echo "Re-tagging images..."
+            docker tag ghcr.io/firecrawl/firecrawl:latest firecrawl-api:latest || true
+            docker tag ghcr.io/firecrawl/playwright-service:latest firecrawl-playwright:latest || true
+
             # Criar backup da versão anterior (se existir)
             if [ "$(docker ps -q -f name=firecrawl-api)" ]; then
               echo "Creating backup of current container..."
