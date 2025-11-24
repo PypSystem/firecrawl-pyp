@@ -1,0 +1,277 @@
+name: Deploy to Homologation
+
+on:
+  push:
+    branches:
+      - dev
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: homologa
+
+    steps:
+      # ==========================================
+      # 1. Checkout do repositório
+      # ==========================================
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      # ==========================================
+      # 2. Configurar Docker Buildx
+      # ==========================================
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      # ==========================================
+      # 3. Criar arquivo .env para build
+      # ==========================================
+      - name: Create .env file for build
+        run: |
+          cat > .env << EOF
+          # API Configuration
+          PORT=${{ vars.PORT }}
+          HOST=0.0.0.0
+          INTERNAL_PORT=${{ vars.INTERNAL_PORT }}
+
+          # Redis
+          REDIS_URL=${{ vars.REDIS_URL }}
+          REDIS_RATE_LIMIT_URL=${{ vars.REDIS_RATE_LIMIT_URL }}
+
+          # Playwright
+          PLAYWRIGHT_MICROSERVICE_URL=${{ vars.PLAYWRIGHT_MICROSERVICE_URL }}
+
+          # Database
+          NUQ_DATABASE_URL=${{ secrets.NUQ_DATABASE_URL }}
+          POSTGRES_HOST_PORT=${{ vars.POSTGRES_HOST_PORT }}
+
+          # Authentication
+          USE_DB_AUTHENTICATION=${{ vars.USE_DB_AUTHENTICATION }}
+          BULL_AUTH_KEY=${{ secrets.BULL_AUTH_KEY }}
+          TEST_API_KEY=${{ secrets.TEST_API_KEY }}
+
+          # AI Features (Optional)
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL=${{ vars.OPENAI_BASE_URL }}
+          MODEL_NAME=${{ vars.MODEL_NAME }}
+          MODEL_EMBEDDING_NAME=${{ vars.MODEL_EMBEDDING_NAME }}
+
+          # Proxy (Optional)
+          PROXY_SERVER=${{ vars.PROXY_SERVER }}
+          PROXY_USERNAME=${{ vars.PROXY_USERNAME }}
+          PROXY_PASSWORD=${{ secrets.PROXY_PASSWORD }}
+          BLOCK_MEDIA=${{ vars.BLOCK_MEDIA }}
+
+          # Logging
+          LOGGING_LEVEL=${{ vars.LOGGING_LEVEL }}
+
+          # Webhooks
+          SELF_HOSTED_WEBHOOK_URL=${{ vars.SELF_HOSTED_WEBHOOK_URL }}
+          ALLOW_LOCAL_WEBHOOKS=${{ vars.ALLOW_LOCAL_WEBHOOKS }}
+
+          # LlamaParse (Optional)
+          LLAMAPARSE_API_KEY=${{ secrets.LLAMAPARSE_API_KEY }}
+
+          # Monitoring (Optional)
+          SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+          POSTHOG_API_KEY=${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_HOST=${{ vars.POSTHOG_HOST }}
+          EOF
+
+      # ==========================================
+      # 4. Build das imagens Docker
+      # ==========================================
+      - name: Build API Docker image
+        run: |
+          docker build \
+            -f apps/api/Dockerfile \
+            -t firecrawl-api:latest \
+            -t firecrawl-api:${{ github.sha }} \
+            .
+
+      - name: Build Playwright Service Docker image
+        run: |
+          docker build \
+            -f apps/playwright-service-ts/Dockerfile \
+            -t firecrawl-playwright:latest \
+            -t firecrawl-playwright:${{ github.sha }} \
+            apps/playwright-service-ts
+
+      - name: Build NUQ Postgres Docker image
+        run: |
+          docker build \
+            -f apps/nuq-postgres/Dockerfile \
+            -t firecrawl-nuq-postgres:latest \
+            -t firecrawl-nuq-postgres:${{ github.sha }} \
+            apps/nuq-postgres
+
+      # ==========================================
+      # 5. Salvar imagens como arquivos
+      # ==========================================
+      - name: Save Docker images
+        run: |
+          docker save firecrawl-api:latest | gzip > firecrawl-api.tar.gz
+          docker save firecrawl-playwright:latest | gzip > firecrawl-playwright.tar.gz
+          docker save firecrawl-nuq-postgres:latest | gzip > firecrawl-nuq-postgres.tar.gz
+
+      # ==========================================
+      # 6. Criar arquivo .env.production para servidor
+      # ==========================================
+      - name: Create .env.production file for server
+        run: cp .env .env.production
+
+      # ==========================================
+      # 7. Enviar arquivos para o servidor
+      # ==========================================
+      - name: Deploy to server via SCP
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts
+
+          # Instalar sshpass
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+          # Criar diretório no servidor
+          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no root@$SSH_HOST \
+            'mkdir -p /root/projeto-ia/firecrawl-pyp'
+
+          # Enviar imagens Docker
+          sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
+            firecrawl-api.tar.gz \
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+
+          sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
+            firecrawl-playwright.tar.gz \
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+
+          sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
+            firecrawl-nuq-postgres.tar.gz \
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+
+          # Enviar docker-compose.prod.yml
+          sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
+            docker-compose.prod.yml \
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+
+          # Enviar .env.production
+          sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
+            .env.production \
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+
+      # ==========================================
+      # 7. Executar deploy no servidor
+      # ==========================================
+      - name: Deploy on server with Docker
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no root@$SSH_HOST 'bash -s' << 'EOF'
+            cd /root/projeto-ia/firecrawl-pyp
+
+            # Limpar espaço ANTES de carregar nova imagem
+            echo "Cleaning up Docker to free space..."
+            docker system prune -a -f || true
+            docker builder prune -a -f || true
+
+            # Remover TODOS os backups antigos
+            echo "Removing ALL old backups..."
+            docker images | grep "firecrawl.*backup" | awk '{print $3}' | xargs -r docker rmi -f || true
+
+            # Carregar as imagens Docker
+            echo "Loading Docker images..."
+            docker load < firecrawl-api.tar.gz
+            docker load < firecrawl-playwright.tar.gz
+            docker load < firecrawl-nuq-postgres.tar.gz
+
+            # Criar backup da versão anterior (se existir)
+            if [ "$(docker ps -q -f name=firecrawl-api)" ]; then
+              echo "Creating backup of current container..."
+              docker commit firecrawl-api firecrawl-api:backup-$(date +%Y%m%d%H%M%S) || echo "Backup failed, continuing..."
+            else
+              echo "No running container to backup, skipping..."
+            fi
+
+            # Parar e remover containers antigos
+            echo "Stopping old containers..."
+            docker compose -f docker-compose.prod.yml down || true
+
+            # Sobrescrever .env com o arquivo do GitHub Actions
+            echo "Updating .env from GitHub Actions..."
+            cp .env.production .env
+
+            # Garantir que a rede Docker existe
+            echo "Ensuring Docker network exists..."
+            docker network create projeto-ia-network 2>/dev/null || echo "Network already exists"
+
+            # Iniciar nova versão
+            echo "Starting new version..."
+            docker compose -f docker-compose.prod.yml up -d
+
+            # Verificar se os containers estão rodando
+            echo "=== Waiting 15 seconds ==="
+            sleep 15
+            echo "=== Checking if containers are running ==="
+            docker ps -a | grep firecrawl || echo "No firecrawl containers found!"
+
+            if [ "$(docker ps -q -f name=firecrawl-api)" ]; then
+              echo "Container started successfully!"
+
+              # Limpar imagens antigas (manter últimas 3)
+              echo "Cleaning up old images..."
+              docker images firecrawl-api --format "{{.ID}} {{.Tag}}" | grep -v latest | tail -n +4 | awk '{print $1}' | xargs -r docker rmi || true
+
+              # Limpar imagens dangling
+              docker image prune -f
+
+              echo "Deployment completed successfully!"
+            else
+              echo "ERROR: Container failed to start!"
+              echo "Rolling back to previous version..."
+              docker tag firecrawl-api:backup-$(date +%Y%m%d)* firecrawl-api:latest
+              docker compose -f docker-compose.prod.yml up -d
+              exit 1
+            fi
+
+            # Limpar arquivos compactados
+            rm -f firecrawl-api.tar.gz firecrawl-playwright.tar.gz firecrawl-nuq-postgres.tar.gz
+          EOF
+
+      # ==========================================
+      # 8. Verificar health do container
+      # ==========================================
+      - name: Health check
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no root@$SSH_HOST 'bash -s' << 'EOF'
+            cd /root/projeto-ia/firecrawl-pyp
+
+            # Aguardar 15 segundos para o container inicializar
+            sleep 15
+
+            # Verificar se container está rodando
+            echo "=== Checking if containers are running ==="
+            docker ps -a | grep firecrawl || echo "No firecrawl containers found!"
+
+            # Verificar status do compose
+            echo "=== Docker Compose Status ==="
+            docker compose -f docker-compose.prod.yml ps
+
+            # Verificar logs do container API
+            echo "=== API Container Logs (last 100 lines) ==="
+            docker compose -f docker-compose.prod.yml logs --tail=100 api
+
+            # Verificar portas abertas
+            echo "=== Checking port 3022 ==="
+            netstat -tlnp | grep 3022 || echo "Port 3022 not listening!"
+
+            # Testar endpoint de health
+            echo "=== Testing health endpoint ==="
+            curl -f http://localhost:3022/v1/health || echo "Health check endpoint not available (may be normal for Firecrawl)"
+          EOF
