@@ -1,0 +1,108 @@
+name: firecrawl-prod
+
+x-common-service: &common-service
+  image: firecrawl-api:latest
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  networks:
+    - projeto-ia-network
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  restart: unless-stopped
+
+x-common-env: &common-env
+  REDIS_URL: ${REDIS_URL:-redis://firecrawl-redis:6379}
+  REDIS_RATE_LIMIT_URL: ${REDIS_RATE_LIMIT_URL:-redis://firecrawl-redis:6379}
+  PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://firecrawl-playwright:3000/scrape}
+  NUQ_DATABASE_URL: ${NUQ_DATABASE_URL:-postgres://postgres:postgres@firecrawl-nuq-postgres:5432/postgres}
+  USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION:-false}
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+  MODEL_NAME: ${MODEL_NAME}
+  MODEL_EMBEDDING_NAME: ${MODEL_EMBEDDING_NAME}
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+  SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+  BULL_AUTH_KEY: ${BULL_AUTH_KEY}
+  TEST_API_KEY: ${TEST_API_KEY}
+  POSTHOG_API_KEY: ${POSTHOG_API_KEY}
+  POSTHOG_HOST: ${POSTHOG_HOST}
+  SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN}
+  SUPABASE_URL: ${SUPABASE_URL}
+  SUPABASE_SERVICE_TOKEN: ${SUPABASE_SERVICE_TOKEN}
+  SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL}
+  SERPER_API_KEY: ${SERPER_API_KEY}
+  SEARCHAPI_API_KEY: ${SEARCHAPI_API_KEY}
+  LOGGING_LEVEL: ${LOGGING_LEVEL:-INFO}
+  PROXY_SERVER: ${PROXY_SERVER}
+  PROXY_USERNAME: ${PROXY_USERNAME}
+  PROXY_PASSWORD: ${PROXY_PASSWORD}
+  SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT}
+  SEARXNG_ENGINES: ${SEARXNG_ENGINES}
+  SEARXNG_CATEGORIES: ${SEARXNG_CATEGORIES}
+  LLAMAPARSE_API_KEY: ${LLAMAPARSE_API_KEY}
+  ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS:-true}
+
+services:
+  firecrawl-playwright:
+    image: firecrawl-playwright:latest
+    container_name: firecrawl-playwright
+    environment:
+      PORT: 3000
+      PROXY_SERVER: ${PROXY_SERVER}
+      PROXY_USERNAME: ${PROXY_USERNAME}
+      PROXY_PASSWORD: ${PROXY_PASSWORD}
+      BLOCK_MEDIA: ${BLOCK_MEDIA}
+    networks:
+      - projeto-ia-network
+    restart: unless-stopped
+
+  firecrawl-api:
+    <<: *common-service
+    container_name: firecrawl-api
+    environment:
+      <<: *common-env
+      HOST: "0.0.0.0"
+      PORT: ${INTERNAL_PORT:-3022}
+      EXTRACT_WORKER_PORT: ${EXTRACT_WORKER_PORT:-3004}
+      WORKER_PORT: ${WORKER_PORT:-3005}
+      ENV: production
+    depends_on:
+      - firecrawl-redis
+      - firecrawl-playwright
+      - firecrawl-nuq-postgres
+    ports:
+      - "${PORT:-3022}:${INTERNAL_PORT:-3022}"
+    command: node dist/src/harness.js --start-docker
+
+  firecrawl-redis:
+    image: redis:alpine
+    container_name: firecrawl-redis
+    networks:
+      - projeto-ia-network
+    command: redis-server --bind 0.0.0.0
+    restart: unless-stopped
+    volumes:
+      - firecrawl-redis-data:/data
+
+  firecrawl-nuq-postgres:
+    image: firecrawl-nuq-postgres:latest
+    container_name: firecrawl-nuq-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+    networks:
+      - projeto-ia-network
+    restart: unless-stopped
+    volumes:
+      - firecrawl-postgres-data:/var/lib/postgresql/data
+
+networks:
+  projeto-ia-network:
+    external: true
+
+volumes:
+  firecrawl-redis-data:
+  firecrawl-postgres-data:
