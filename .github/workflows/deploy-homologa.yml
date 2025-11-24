@@ -79,23 +79,16 @@ jobs:
           EOF
 
       # ==========================================
-      # 4. Build das imagens Docker
+      # 4. Pull das imagens Docker oficiais
       # ==========================================
-      - name: Build API Docker image
+      - name: Pull official Docker images
         run: |
-          docker build \
-            -f apps/api/Dockerfile \
-            -t firecrawl-api:latest \
-            -t firecrawl-api:${{ github.sha }} \
-            .
+          docker pull ghcr.io/mendableai/firecrawl:latest
+          docker pull ghcr.io/mendableai/firecrawl-playwright:latest
 
-      - name: Build Playwright Service Docker image
-        run: |
-          docker build \
-            -f apps/playwright-service-ts/Dockerfile \
-            -t firecrawl-playwright:latest \
-            -t firecrawl-playwright:${{ github.sha }} \
-            apps/playwright-service-ts
+          # Tag para nosso padrão
+          docker tag ghcr.io/mendableai/firecrawl:latest firecrawl-api:latest
+          docker tag ghcr.io/mendableai/firecrawl-playwright:latest firecrawl-playwright:latest
 
       - name: Build NUQ Postgres Docker image
         run: |
