@@ -2,6 +2,7 @@ name: firecrawl-prod
 
 x-common-service: &common-service
   image: firecrawl-api:latest
+  pull_policy: never
   ulimits:
     nofile:
       soft: 65535
@@ -47,6 +48,7 @@ x-common-env: &common-env
 services:
   firecrawl-playwright:
     image: firecrawl-playwright:latest
+    pull_policy: never
     container_name: firecrawl-playwright
     environment:
       PORT: 3000
@@ -88,6 +90,7 @@ services:
 
   firecrawl-nuq-postgres:
     image: firecrawl-nuq-postgres:latest
+    pull_policy: never
     container_name: firecrawl-nuq-postgres
     environment:
       POSTGRES_USER: postgres

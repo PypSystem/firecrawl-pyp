@@ -181,10 +181,20 @@ jobs:
             docker load < firecrawl-playwright.tar.gz
             docker load < firecrawl-nuq-postgres.tar.gz
 
+            # Listar imagens carregadas para debug
+            echo "=== Docker images after load ==="
+            docker images | grep -E "firecrawl|ghcr.io/firecrawl" || echo "No firecrawl images found!"
+
             # Re-tag imagens (docker load pode restaurar com nome original)
             echo "Re-tagging images..."
-            docker tag ghcr.io/firecrawl/firecrawl:latest firecrawl-api:latest || true
-            docker tag ghcr.io/firecrawl/playwright-service:latest firecrawl-playwright:latest || true
+            docker tag ghcr.io/firecrawl/firecrawl:latest firecrawl-api:latest 2>/dev/null || echo "ghcr.io/firecrawl/firecrawl:latest not found, checking if firecrawl-api:latest exists..."
+            docker tag ghcr.io/firecrawl/playwright-service:latest firecrawl-playwright:latest 2>/dev/null || echo "ghcr.io/firecrawl/playwright-service:latest not found, checking if firecrawl-playwright:latest exists..."
+
+            # Verificar se as imagens necessárias existem
+            echo "=== Verifying required images ==="
+            docker images firecrawl-api:latest --format "{{.Repository}}:{{.Tag}}" || { echo "ERROR: firecrawl-api:latest not found!"; exit 1; }
+            docker images firecrawl-playwright:latest --format "{{.Repository}}:{{.Tag}}" || { echo "ERROR: firecrawl-playwright:latest not found!"; exit 1; }
+            docker images firecrawl-nuq-postgres:latest --format "{{.Repository}}:{{.Tag}}" || { echo "ERROR: firecrawl-nuq-postgres:latest not found!"; exit 1; }
 
             # Criar backup da versão anterior (se existir)
             if [ "$(docker ps -q -f name=firecrawl-api)" ]; then
