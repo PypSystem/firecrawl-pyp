@@ -129,31 +129,31 @@ jobs:
           sudo apt-get install -y sshpass
 
           # Criar diretório no servidor
-          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no ubuntu@$SSH_HOST \
+          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no root@$SSH_HOST \
             'mkdir -p /root/projeto-ia/firecrawl-pyp'
 
           # Enviar imagens Docker
           sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
             firecrawl-api.tar.gz \
-            ubuntu@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
 
           sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
             firecrawl-playwright.tar.gz \
-            ubuntu@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
 
           sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
             firecrawl-nuq-postgres.tar.gz \
-            ubuntu@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
 
           # Enviar docker-compose.prod.yml
           sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
             docker-compose.prod.yml \
-            ubuntu@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
 
           # Enviar .env.production
           sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
             .env.production \
-            ubuntu@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
+            root@$SSH_HOST:/root/projeto-ia/firecrawl-pyp/
 
       # ==========================================
       # 7. Executar deploy no servidor
@@ -163,7 +163,7 @@ jobs:
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
-          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no ubuntu@$SSH_HOST 'bash -s' << 'EOF'
+          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no root@$SSH_HOST 'bash -s' << 'EOF'
             cd /root/projeto-ia/firecrawl-pyp
 
             # Limpar espaço ANTES de carregar nova imagem
@@ -247,7 +247,7 @@ jobs:
           SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
-          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no ubuntu@$SSH_HOST 'bash -s' << 'EOF'
+          sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no root@$SSH_HOST 'bash -s' << 'EOF'
             cd /root/projeto-ia/firecrawl-pyp
 
             # Aguardar 15 segundos para o container inicializar
