@@ -2,6 +2,7 @@ name: firecrawl-prod
 
 x-common-service: &common-service
   image: firecrawl-api:latest
+  pull_policy: never
   ulimits:
     nofile:
       soft: 65535
@@ -17,6 +18,7 @@ x-common-env: &common-env
   REDIS_RATE_LIMIT_URL: ${REDIS_RATE_LIMIT_URL:-redis://firecrawl-redis:6379}
   PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://firecrawl-playwright:3000/scrape}
   NUQ_DATABASE_URL: ${NUQ_DATABASE_URL:-postgres://postgres:postgres@firecrawl-nuq-postgres:5432/postgres}
+  NUQ_RABBITMQ_URL: ${NUQ_RABBITMQ_URL:-amqp://guest:guest@firecrawl-rabbitmq:5672}
   USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION:-false}
   OPENAI_API_KEY: ${OPENAI_API_KEY}
   OPENAI_BASE_URL: ${OPENAI_BASE_URL}
@@ -47,6 +49,7 @@ x-common-env: &common-env
 services:
   firecrawl-playwright:
     image: firecrawl-playwright:latest
+    pull_policy: never
     container_name: firecrawl-playwright
     environment:
       PORT: 3000
@@ -72,6 +75,7 @@ services:
       - firecrawl-redis
       - firecrawl-playwright
       - firecrawl-nuq-postgres
+      - firecrawl-rabbitmq
     ports:
       - "${PORT:-3022}:${INTERNAL_PORT:-3022}"
     command: node dist/src/harness.js --start-docker
@@ -88,6 +92,7 @@ services:
 
   firecrawl-nuq-postgres:
     image: firecrawl-nuq-postgres:latest
+    pull_policy: never
     container_name: firecrawl-nuq-postgres
     environment:
       POSTGRES_USER: postgres
@@ -99,6 +104,15 @@ services:
     volumes:
       - firecrawl-postgres-data:/var/lib/postgresql/data
 
+  firecrawl-rabbitmq:
+    image: rabbitmq:3-alpine
+    container_name: firecrawl-rabbitmq
+    networks:
+      - projeto-ia-network
+    restart: unless-stopped
+    volumes:
+      - firecrawl-rabbitmq-data:/var/lib/rabbitmq
+
 networks:
   projeto-ia-network:
     external: true
@@ -106,3 +120,4 @@ networks:
 volumes:
   firecrawl-redis-data:
   firecrawl-postgres-data:
+  firecrawl-rabbitmq-data:

@@ -41,6 +41,9 @@ interface UrlModel {
   headers?: { [key: string]: string };
   check_selector?: string;
   skip_tls_verification?: boolean;
+  screenshot?: boolean;
+  screenshot_full_page?: boolean;
+  screenshot_quality?: number;
 }
 
 let browser: Browser;
@@ -120,7 +123,21 @@ const isValidUrl = (urlString: string): boolean => {
   }
 };
 
-const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networkidle', waitAfterLoad: number, timeout: number, checkSelector: string | undefined) => {
+interface ScreenshotOptions {
+  enabled?: boolean;
+  fullPage?: boolean;
+  quality?: number;
+}
+
+const scrapePage = async (
+  page: Page,
+  url: string,
+  waitUntil: 'load' | 'networkidle',
+  waitAfterLoad: number,
+  timeout: number,
+  checkSelector: string | undefined,
+  screenshotOptions?: ScreenshotOptions
+) => {
   console.log(`Navigating to ${url} with waitUntil: ${waitUntil} and timeout: ${timeout}ms`);
   const response = await page.goto(url, { waitUntil, timeout });
 
@@ -146,11 +163,23 @@ const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networki
     }
   }
 
+  // Capture screenshot if requested
+  let screenshot: string | undefined = undefined;
+  if (screenshotOptions?.enabled) {
+    console.log(`Taking screenshot (fullPage: ${screenshotOptions.fullPage ?? false})`);
+    const screenshotBuffer = await page.screenshot({
+      fullPage: screenshotOptions.fullPage ?? false,
+      type: 'png',
+    });
+    screenshot = screenshotBuffer.toString('base64');
+  }
+
   return {
     content,
     status: response ? response.status() : null,
     headers,
     contentType: ct,
+    screenshot,
   };
 };
 
@@ -176,7 +205,17 @@ app.get('/health', async (req: Request, res: Response) => {
 });
 
 app.post('/scrape', async (req: Request, res: Response) => {
-  const { url, wait_after_load = 0, timeout = 15000, headers, check_selector, skip_tls_verification = false }: UrlModel = req.body;
+  const {
+    url,
+    wait_after_load = 0,
+    timeout = 15000,
+    headers,
+    check_selector,
+    skip_tls_verification = false,
+    screenshot = false,
+    screenshot_full_page = false,
+    screenshot_quality,
+  }: UrlModel = req.body;
 
   console.log(`================= Scrape Request =================`);
   console.log(`URL: ${url}`);
@@ -185,6 +224,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
   console.log(`Headers: ${headers ? JSON.stringify(headers) : 'None'}`);
   console.log(`Check Selector: ${check_selector ? check_selector : 'None'}`);
   console.log(`Skip TLS Verification: ${skip_tls_verification}`);
+  console.log(`Screenshot: ${screenshot} (fullPage: ${screenshot_full_page})`);
   console.log(`==================================================`);
 
   if (!url) {
@@ -211,16 +251,22 @@ app.post('/scrape', async (req: Request, res: Response) => {
     await page.setExtraHTTPHeaders(headers);
   }
 
+  const screenshotOptions: ScreenshotOptions = {
+    enabled: screenshot,
+    fullPage: screenshot_full_page,
+    quality: screenshot_quality,
+  };
+
   let result: Awaited<ReturnType<typeof scrapePage>>;
   try {
     // Strategy 1: Normal
     console.log('Attempting strategy 1: Normal load');
-    result = await scrapePage(page, url, 'load', wait_after_load, timeout, check_selector);
+    result = await scrapePage(page, url, 'load', wait_after_load, timeout, check_selector, screenshotOptions);
   } catch (error) {
     console.log('Strategy 1 failed, attempting strategy 2: Wait until networkidle');
     try {
       // Strategy 2: Wait until networkidle
-      result = await scrapePage(page, url, 'networkidle', wait_after_load, timeout, check_selector);
+      result = await scrapePage(page, url, 'networkidle', wait_after_load, timeout, check_selector, screenshotOptions);
     } catch (finalError) {
       await page.close();
       await requestContext.close();
@@ -243,7 +289,8 @@ app.post('/scrape', async (req: Request, res: Response) => {
     content: result.content,
     pageStatusCode: result.status,
     contentType: result.contentType,
-    ...(pageError && { pageError })
+    ...(pageError && { pageError }),
+    ...(result.screenshot && { screenshot: result.screenshot })
   });
 });
 
