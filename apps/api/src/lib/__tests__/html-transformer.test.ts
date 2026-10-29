@@ -261,6 +261,51 @@ describe("HTML Transformer", () => {
       const metadata = await extractMetadata(html);
       expect(metadata).toBeDefined();
     });
+
+    it("should backfill title from og:title when title tag is missing", async () => {
+      const html = `
+        <html>
+          <head>
+            <meta property="og:title" content="OpenGraph Title">
+            <meta name="description" content="Page description">
+          </head>
+          <body></body>
+        </html>
+      `;
+      const metadata = await extractMetadata(html);
+      expect(metadata.title).toBe("OpenGraph Title");
+      expect(metadata.ogTitle).toBe("OpenGraph Title");
+    });
+
+    it("should backfill title from twitter:title when title and og:title are missing", async () => {
+      const html = `
+        <html>
+          <head>
+            <meta name="twitter:title" content="Twitter Title">
+            <meta name="description" content="Page description">
+          </head>
+          <body></body>
+        </html>
+      `;
+      const metadata = await extractMetadata(html);
+      expect(metadata.title).toBe("Twitter Title");
+    });
+
+    it("should not backfill title when title tag exists", async () => {
+      const html = `
+        <html>
+          <head>
+            <title>Primary Title</title>
+            <meta property="og:title" content="OpenGraph Title">
+            <meta name="twitter:title" content="Twitter Title">
+          </head>
+          <body></body>
+        </html>
+      `;
+      const metadata = await extractMetadata(html);
+      expect(metadata.title).toBe("Primary Title");
+      expect(metadata.ogTitle).toBe("OpenGraph Title");
+    });
   });
 
   describe("transformHtml", () => {
@@ -408,6 +453,77 @@ describe("HTML Transformer", () => {
       expect(result).toContain("©");
       expect(result).toContain("á é í ó ú ñ");
       expect(result).toContain("🎉 👍 🚀");
+    });
+
+    it("should pick the largest image from a lazy-loaded data-srcset", async () => {
+      // Lazy loaders keep a tiny placeholder in `src` and the real responsive
+      // image in `data-srcset` until the image scrolls into view.
+      const options: TransformHtmlOptions = {
+        html: `
+          <div>
+            <img
+              src="https://cdn.example.com/photo.png?width=5"
+              data-src="https://cdn.example.com/photo.png"
+              data-srcset="https://cdn.example.com/photo.png?width=320 320w, https://cdn.example.com/photo.png?width=1296 1296w">
+          </div>
+        `,
+        url: "https://example.com",
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: false,
+      };
+
+      const result = await transformHtml(options);
+      expect(result).toContain(
+        'src="https://cdn.example.com/photo.png?width=1296"',
+      );
+      expect(result).not.toContain("width=5");
+    });
+
+    it("should fall back to data-src when there is no srcset", async () => {
+      const options: TransformHtmlOptions = {
+        html: `
+          <div>
+            <img
+              src="https://cdn.example.com/photo.png?width=5"
+              data-src="https://cdn.example.com/photo.png">
+          </div>
+        `,
+        url: "https://example.com",
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: false,
+      };
+
+      const result = await transformHtml(options);
+      expect(result).toContain('src="https://cdn.example.com/photo.png"');
+      expect(result).not.toContain("width=5");
+    });
+
+    it("should prefer a real srcset over data-srcset when both are present", async () => {
+      // Once the lazy loader fires, `srcset` holds the real image; we must not
+      // override it with the (now stale) data-* attributes.
+      const options: TransformHtmlOptions = {
+        html: `
+          <div>
+            <img
+              src="https://cdn.example.com/real.png?width=800"
+              srcset="https://cdn.example.com/real.png?width=400 400w, https://cdn.example.com/real.png?width=800 800w"
+              data-srcset="https://cdn.example.com/placeholder.png?width=5 5w">
+          </div>
+        `,
+        url: "https://example.com",
+        includeTags: [],
+        excludeTags: [],
+        onlyMainContent: false,
+      };
+
+      const result = await transformHtml(options);
+      expect(result).toContain(
+        'src="https://cdn.example.com/real.png?width=800"',
+      );
+      // The src must not be overwritten by the (stale) data-srcset placeholder.
+      expect(result).not.toContain('src="https://cdn.example.com/placeholder');
     });
 
     it("should make all URLs absolute", async () => {

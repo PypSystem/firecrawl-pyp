@@ -1,4 +1,6 @@
 import "dotenv/config";
+import { config } from "../../config";
+import { shutdownTracing } from "../../otel";
 import {
   scrapeQueue,
   nuqGetLocalMetrics,
@@ -24,8 +26,16 @@ import { logger } from "../../lib/logger";
   });
 
   const server = app.listen(
-    Number(process.env.NUQ_PREFETCH_WORKER_PORT ?? process.env.PORT ?? 3011),
-    () => {
+    config.NUQ_PREFETCH_WORKER_PORT,
+    (error?: Error) => {
+      if (error) {
+        logger.error("Failed to start NuQ prefetch worker metrics server", {
+          error,
+          port: config.NUQ_PREFETCH_WORKER_PORT,
+        });
+        throw error;
+      }
+
       logger.info("NuQ prefetch worker metrics server started");
     },
   );
@@ -33,21 +43,38 @@ import { logger } from "../../lib/logger";
   async function shutdown() {
     server.close();
     await nuqShutdown();
+    await shutdownTracing();
     process.exit(0);
   }
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
-
-  (async () => {
-    while (true) {
-      await crawlFinishedQueue.prefetchJobs();
-      await new Promise(resolve => setTimeout(resolve, 250));
-    }
-  })();
-
-  while (true) {
-    await scrapeQueue.prefetchJobs();
-    await new Promise(resolve => setTimeout(resolve, 250));
+  if (require.main === module) {
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
   }
+
+  try {
+    await Promise.all([
+      (async () => {
+        while (true) {
+          await crawlFinishedQueue.prefetchJobs();
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+      })(),
+      (async () => {
+        while (true) {
+          if (config.NUQ_PREFETCH_WORKER_HEARTBEAT_URL) {
+            fetch(config.NUQ_PREFETCH_WORKER_HEARTBEAT_URL).catch(() => {});
+          }
+          await scrapeQueue.prefetchJobs();
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+      })(),
+    ]);
+  } catch (error) {
+    logger.error("Error in prefetch worker", { error });
+    process.exit(1);
+  }
+
+  logger.info("All prefetch workers exited. Shutting down...");
+  await shutdown();
 })();

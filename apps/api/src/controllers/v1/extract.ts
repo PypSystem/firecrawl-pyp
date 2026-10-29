@@ -1,3 +1,4 @@
+import { v7 as uuidv7 } from "uuid";
 import { Request, Response } from "express";
 import {
   RequestWithAuth,
@@ -5,20 +6,34 @@ import {
   extractRequestSchema,
   ExtractResponse,
 } from "./types";
-import { getExtractQueue } from "../../services/queue-service";
+import { addExtractJobToQueue } from "../../services/queue-service";
 import { saveExtract } from "../../lib/extract/extract-redis";
 import { getTeamIdSyncB } from "../../lib/extract/team-id-sync";
-import {
-  ExtractResult,
-  performExtraction,
-} from "../../lib/extract/extraction-service";
+import { ExtractResult } from "../../lib/extract/types";
 import { performExtraction_F0 } from "../../lib/extract/fire-0/extraction-service-f0";
-import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { logger as _logger } from "../../lib/logger";
-import { fromV1ScrapeOptions } from "../v2/types";
+import {
+  fromV1ScrapeOptions,
+  ExtractRequest as V2ExtractRequest,
+} from "../v2/types";
 import { createWebhookSender, WebhookEvent } from "../../services/webhook";
+import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
+import { config } from "../../config";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
+import { calculateThreatScanCredits } from "../../lib/scrape-billing";
+import { billTeam } from "../../services/billing/credit_billing";
+import { emitRejectedScrapeActivityEvents } from "../../lib/siem-logging";
+import { UnsupportedSiteError } from "../../lib/error";
+import { isSdkOrigin } from "../../lib/sdk-origin";
 async function oldExtract(
   req: RequestWithAuth<{}, ExtractResponse, ExtractRequest>,
   res: Response<ExtractResponse>,
@@ -37,23 +52,28 @@ async function oldExtract(
   sender?.send(WebhookEvent.EXTRACT_STARTED, { success: true });
 
   try {
+    // Convert v1 scrapeOptions to v2 format
+    const scrapeOptions = req.body.scrapeOptions
+      ? fromV1ScrapeOptions(
+          req.body.scrapeOptions,
+          req.body.scrapeOptions.timeout,
+          req.auth.team_id,
+        ).scrapeOptions
+      : undefined;
+
+    // Create request with converted scrapeOptions (v2 format)
+    const request: V2ExtractRequest = {
+      ...req.body,
+      scrapeOptions,
+    } as V2ExtractRequest;
+
     let result: ExtractResult;
-    const model = req.body.agent?.model;
-    if (req.body.agent && model && model.toLowerCase().includes("fire-1")) {
-      result = await performExtraction(extractId, {
-        request: req.body,
-        teamId: req.auth.team_id,
-        subId: req.acuc?.sub_id ?? undefined,
-        apiKeyId: req.acuc?.api_key_id ?? null,
-      });
-    } else {
-      result = await performExtraction_F0(extractId, {
-        request: req.body,
-        teamId: req.auth.team_id,
-        subId: req.acuc?.sub_id ?? undefined,
-        apiKeyId: req.acuc?.api_key_id ?? null,
-      });
-    }
+    result = await performExtraction_F0(extractId, {
+      request,
+      teamId: req.auth.team_id,
+      apiKeyId: req.acuc?.api_key_id ?? null,
+      externalRequestId: externalRequestId(req),
+    });
 
     if (sender) {
       if (result.success) {
@@ -93,11 +113,12 @@ export async function extractController(
   req: RequestWithAuth<{}, ExtractResponse, ExtractRequest>,
   res: Response<ExtractResponse>,
 ) {
-  const selfHosted = process.env.USE_DB_AUTHENTICATION !== "true";
+  const selfHosted = config.USE_DB_AUTHENTICATION !== true;
   const originalRequest = { ...req.body };
   req.body = extractRequestSchema.parse(req.body);
+  const extractId = uuidv7();
 
-  if (req.acuc?.flags?.forceZDR) {
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
     return res.status(400).json({
       success: false,
       error:
@@ -107,8 +128,28 @@ export async function extractController(
 
   const invalidURLs: string[] =
     req.body.urls?.filter((url: string) =>
-      isUrlBlocked(url, req.acuc?.flags ?? null),
+      isUrlBlocked(url, req.acuc?.flags ?? null, {
+        team_id: req.auth.team_id,
+        org_id: req.acuc?.org_id ?? null,
+        origin: req.body.origin ?? null,
+      }),
     ) ?? [];
+
+  emitRejectedScrapeActivityEvents(
+    invalidURLs.map(url => ({
+      scrapeId: uuidv7(),
+      requestId: extractId,
+      endpoint: "extract",
+      teamId: req.auth.team_id,
+      apiKeyId: req.acuc?.api_key_id ?? null,
+      auditMetadata: req.body.scrapeOptions?.auditMetadata,
+      url,
+      error: new UnsupportedSiteError(),
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      zeroDataRetention: false,
+    })),
+  );
 
   const createdAt = Date.now();
 
@@ -116,21 +157,114 @@ export async function extractController(
     if (!res.headersSent) {
       return res.status(403).json({
         success: false,
-        error: BLOCKLISTED_URL_MESSAGE,
+        error: UNSUPPORTED_SITE_MESSAGE,
       });
     }
   }
 
-  const extractId = crypto.randomUUID();
+  // Threat protection: check target URLs before fetching. Blocked URLs are
+  // reported via invalidURLs (with ignoreInvalidURLs) or reject the request.
+  // Discovered URLs are enforced in the scrape pipeline via the policy
+  // threaded through the extract job.
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+  if (threatProtection.policy && (req.body.urls?.length ?? 0) > 0) {
+    const { blocked, decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+      req.body.urls ?? [],
+      threatProtection.policy,
+      { teamId: req.auth.team_id },
+    );
+    // Consulted decisions bill the scan fee (+2 per unique scanned URL) —
+    // including when the request is rejected below: the scans already
+    // happened.
+    const threatScanCredits = calculateThreatScanCredits(
+      decisionsByUrl.values(),
+    );
+    if (threatScanCredits > 0) {
+      billTeam(
+        req.auth.team_id,
+        req.acuc?.org_id ?? null,
+        threatScanCredits,
+        req.acuc?.api_key_id ?? null,
+        {
+          endpoint: "extract",
+          externalRequestId: externalRequestId(req),
+          // Suffixed: the extract's MAIN charge (fire-0) uses the bare
+          // extractId — a shared key would collapse the two into one charge.
+          chargeId: `${extractId}:threat`,
+        },
+      ).catch(error => {
+        _logger.error(
+          `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
+        );
+      });
+    }
+    if (blocked.length > 0) {
+      emitRejectedScrapeActivityEvents(
+        blocked
+          .filter(blockedUrl => !invalidURLs.includes(blockedUrl.url))
+          .map(blockedUrl => ({
+            scrapeId: uuidv7(),
+            requestId: extractId,
+            endpoint: "extract",
+            teamId: req.auth.team_id,
+            apiKeyId: req.acuc?.api_key_id ?? null,
+            auditMetadata: req.body.scrapeOptions?.auditMetadata,
+            url: blockedUrl.url,
+            error: new UnsafeDomainBlockedError(
+              blockedUrl.url,
+              blockedUrl.decision,
+            ),
+            threatDecisions: [blockedUrl.decision],
+            origin: req.body.origin ?? "api",
+            integration: req.body.integration,
+            zeroDataRetention: false,
+          })),
+      );
+      if (req.body.ignoreInvalidURLs) {
+        invalidURLs.push(...blocked.map(x => x.url));
+      } else {
+        const first = blocked[0];
+        const error = new UnsafeDomainBlockedError(first.url, first.decision);
+        return res.status(403).json({
+          success: false,
+          code: error.code,
+          error: error.message,
+        });
+      }
+    }
+  }
 
   _logger.info("Extract starting...", {
     request: req.body,
     originalRequest,
     teamId: req.auth.team_id,
     team_id: req.auth.team_id,
-    subId: req.acuc?.sub_id,
     extractId,
-    zeroDataRetention: req.acuc?.flags?.forceZDR,
+    zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
+  });
+
+  await logRequest({
+    id: extractId,
+    kind: "extract",
+    api_version: "v1",
+    external_request_id: externalRequestId(req),
+    team_id: req.auth.team_id,
+    origin: req.body.origin ?? "api",
+    integration: req.body.integration,
+    target_hint: req.body.urls?.[0] ?? "",
+    zeroDataRetention: false, // not supported for extract
+    api_key_id: req.acuc?.api_key_id ?? null,
   });
 
   const scrapeOptions = req.body.scrapeOptions
@@ -147,10 +281,10 @@ export async function extractController(
       scrapeOptions,
     },
     teamId: req.auth.team_id,
-    subId: req.acuc?.sub_id,
     extractId,
     agent: req.body.agent,
     apiKeyId: req.acuc?.api_key_id ?? null,
+    externalRequestId: externalRequestId(req),
     createdAt,
   };
 
@@ -158,8 +292,7 @@ export async function extractController(
     (await getTeamIdSyncB(req.auth.team_id)) &&
     req.body.origin !== "api-sdk" &&
     req.body.origin !== "website" &&
-    !req.body.origin.startsWith("python-sdk@") &&
-    !req.body.origin.startsWith("js-sdk@")
+    !isSdkOrigin(req.body.origin)
   ) {
     return await oldExtract(req, res, extractId);
   }
@@ -173,12 +306,10 @@ export async function extractController(
     showLLMUsage: req.body.__experimental_llmUsage,
     showSources: req.body.__experimental_showSources || req.body.showSources,
     showCostTracking: req.body.__experimental_showCostTracking,
-    zeroDataRetention: req.acuc?.flags?.forceZDR,
+    zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
   });
 
-  await getExtractQueue().add(extractId, jobData, {
-    jobId: extractId,
-  });
+  await addExtractJobToQueue(extractId, jobData);
 
   return res.status(200).json({
     success: true,

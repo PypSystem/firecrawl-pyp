@@ -3,25 +3,28 @@ import { updateGeneratedLlmsTxt } from "./generate-llmstxt-redis";
 import { getMapResults } from "../../controllers/v1/map";
 import { z } from "zod";
 import { scrapeDocument } from "../extract/document-scraper";
+import { hasOrgScopedBlocklist } from "../../scraper/WebScraper/utils/blocklist";
 import {
   getLlmsTextFromCache,
   saveLlmsTextToCache,
 } from "./generate-llmstxt-supabase";
 import { billTeam } from "../../services/billing/credit_billing";
-import { logJob } from "../../services/logging/log_job";
+import { logLlmsTxt } from "../../services/logging/log_job";
 import { getModel } from "../generic-ai";
 import { generateCompletions } from "../../scraper/scrapeURL/transformers/llmExtract";
 import { CostTracking } from "../cost-tracking";
 import { getACUCTeam } from "../../controllers/auth";
+import { orgIdFromAcuc } from "../team-org";
 interface GenerateLLMsTextServiceOptions {
   generationId: string;
   teamId: string;
   apiKeyId: number | null;
+  /** The caller's External-Request-Id, carried on the charge for firebill. */
+  externalRequestId?: string | null;
   url: string;
   maxUrls: number;
   showFullText: boolean;
   cache?: boolean;
-  subId?: string;
 }
 
 const descriptionSchema = z.object({
@@ -72,7 +75,6 @@ export async function performGenerateLlmsTxt(
     maxUrls = 100,
     showFullText,
     cache = true,
-    subId,
     apiKeyId,
   } = options;
   const startTime = Date.now();
@@ -89,10 +91,18 @@ export async function performGenerateLlmsTxt(
     // Enforce max URL limit
     const effectiveMaxUrls = Math.min(maxUrls, 5000);
 
+    // The cache is shared across teams, so a requester under org-scoped
+    // blocklist rules must not touch it at all: even with the origin URL
+    // itself unblocked, mapped child URLs may still be blocked, so a cached
+    // generation could hand them blocked content and their filtered output
+    // would poison the cache for everyone else.
+    const skipSharedCache = hasOrgScopedBlocklist(acuc?.org_id);
+
     // Check cache first, unless cache is set to false
-    const cachedResult = cache
-      ? await getLlmsTextFromCache(url, effectiveMaxUrls)
-      : null;
+    const cachedResult =
+      cache && !skipSharedCache
+        ? await getLlmsTextFromCache(url, effectiveMaxUrls)
+        : null;
     if (cachedResult) {
       logger.info("Found cached LLMs text", { url });
 
@@ -132,6 +142,7 @@ export async function performGenerateLlmsTxt(
     const mapResult = await getMapResults({
       url,
       teamId,
+      orgId: acuc?.org_id ?? null,
       limit: effectiveMaxUrls,
       includeSubdomains: false,
       ignoreSitemap: false,
@@ -161,11 +172,13 @@ export async function performGenerateLlmsTxt(
               {
                 url,
                 teamId,
+                orgId: acuc?.org_id ?? null,
                 origin: "llmstxt",
                 timeout: 30000,
                 isSingleUrl: true,
                 flags: acuc?.flags ?? null,
                 apiKeyId,
+                requestId: generationId,
               },
               [],
               logger,
@@ -234,7 +247,9 @@ export async function performGenerateLlmsTxt(
     }
 
     // After successful generation, save to cache
-    await saveLlmsTextToCache(url, llmstxt, llmsFulltxt, effectiveMaxUrls);
+    if (!skipSharedCache) {
+      await saveLlmsTextToCache(url, llmstxt, llmsFulltxt, effectiveMaxUrls);
+    }
 
     // Limit pages and remove separators before final update
     const limitedFullText = limitPages(llmsFulltxt, effectiveMaxUrls);
@@ -249,28 +264,36 @@ export async function performGenerateLlmsTxt(
     });
 
     // Log job with token usage and sources
-    await logJob({
-      job_id: generationId,
-      success: true,
-      message: "LLMs text generation completed",
-      num_docs: urls.length,
-      docs: [{ llmstxt: llmstxt, llmsfulltxt: llmsFulltxt }],
-      time_taken: (Date.now() - startTime) / 1000,
+    await logLlmsTxt({
+      id: generationId,
+      request_id: generationId,
+      url,
       team_id: teamId,
-      mode: "llmstxt",
-      url: url,
-      scrapeOptions: options,
-      origin: "api",
-      num_tokens: 0,
-      tokens_billed: 0,
-      sources: {},
-      cost_tracking: costTracking,
-      credits_billed: urls.length,
-      zeroDataRetention: false,
+      options: {
+        maxUrls: maxUrls,
+        showFullText: showFullText,
+        cache: cache,
+      },
+      num_urls: urls.length,
+      cost_tracking: costTracking.toJSON(),
+      credits_cost: urls.length,
+      result: { llmstxt, llmsfulltxt: llmsFulltxt },
     });
 
     // Bill team for usage
-    billTeam(teamId, subId, urls.length, apiKeyId, logger).catch(error => {
+    billTeam(
+      teamId,
+      orgIdFromAcuc(acuc),
+      urls.length,
+      apiKeyId,
+      {
+        endpoint: "llms_txt",
+        jobId: generationId,
+        chargeId: generationId,
+        externalRequestId: options.externalRequestId ?? null,
+      },
+      logger,
+    ).catch(error => {
       logger.error(`Failed to bill team ${teamId} for ${urls.length} urls`, {
         teamId,
         count: urls.length,

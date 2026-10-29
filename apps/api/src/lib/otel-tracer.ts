@@ -1,73 +1,298 @@
 import {
-  trace,
   context,
-  SpanStatusCode,
-  Span,
-  SpanKind,
-  Attributes,
+  createContextKey,
+  isSpanContextValid,
   propagation,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+  type Attributes,
+  type AttributeValue,
+  type Context,
+  type Link,
+  type Span,
 } from "@opentelemetry/api";
-// import { Logger } from 'winston';
+import {
+  AlwaysOnSampler,
+  BatchSpanProcessor,
+  NodeTracerProvider,
+  ParentBasedSampler,
+  SamplingDecision,
+  type ReadableSpan,
+  type Sampler,
+  type SamplingResult,
+  type SpanExporter,
+  type SpanProcessor,
+} from "@opentelemetry/sdk-trace-node";
+import {
+  defaultResource,
+  detectResources,
+  envDetector,
+  resourceFromAttributes,
+} from "@opentelemetry/resources";
+import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 
-const tracer = trace.getTracer("firecrawl-api", "1.0.0");
+export { SpanKind } from "@opentelemetry/api";
+export type { Span } from "@opentelemetry/api";
 
-export { SpanKind };
+const TRACER_NAME = "firecrawl-api";
 
-// Trace context propagation utilities
+// Zero data retention (ZDR) spans must never leave the process. Two layers
+// enforce that:
+//  1. `withZeroDataRetention` flags the active context; the sampler turns every
+//     span started under it (our own and library spans such as the AI SDK's)
+//     into a non-recording span, so nothing is even buffered.
+//  2. Any span that ends carrying a `zero_data_retention` /
+//     `*.zero_data_retention` attribute set to `true` is dropped before export,
+//     covering spans that only learn about ZDR after they started.
+const ZERO_DATA_RETENTION_CONTEXT_KEY = createContextKey(
+  "firecrawl.zero_data_retention",
+);
+
+export function withZeroDataRetention<T>(
+  zeroDataRetention: boolean | undefined,
+  fn: () => T,
+): T {
+  if (!zeroDataRetention) {
+    return fn();
+  }
+
+  return context.with(
+    context.active().setValue(ZERO_DATA_RETENTION_CONTEXT_KEY, true),
+    fn,
+  );
+}
+
+function isZeroDataRetentionContext(ctx: Context): boolean {
+  return ctx.getValue(ZERO_DATA_RETENTION_CONTEXT_KEY) === true;
+}
+
+/**
+ * Whether the caller runs under `withZeroDataRetention` (or a ZDR `withSpan`),
+ * for code that must also switch off telemetry it controls directly, such as
+ * the AI SDK's `experimental_telemetry`.
+ */
+export function isZeroDataRetentionActive(): boolean {
+  return isZeroDataRetentionContext(context.active());
+}
+
+// Traces flagged ZDR after their root span started (a `*.zero_data_retention`
+// attribute set from inside a *recording* span). Descendants started afterwards
+// are not recorded and spans of these traces still in flight are dropped when
+// they end. Only recording spans register here: a non-recording span already
+// suppresses its descendants through parent-based sampling, so the registry
+// only sees the rare late-discovery case and stays far below its cap. The cap
+// is a memory guard, not an expected steady state.
+const ZERO_DATA_RETENTION_TRACE_LIMIT = 100_000;
+const zeroDataRetentionTraces = new Set<string>();
+
+function markTraceZeroDataRetention(traceId: string): void {
+  if (zeroDataRetentionTraces.has(traceId)) {
+    return;
+  }
+
+  zeroDataRetentionTraces.add(traceId);
+  if (zeroDataRetentionTraces.size > ZERO_DATA_RETENTION_TRACE_LIMIT) {
+    const oldest = zeroDataRetentionTraces.values().next().value;
+    if (oldest !== undefined) {
+      zeroDataRetentionTraces.delete(oldest);
+    }
+  }
+}
+
+function hasZeroDataRetentionAttribute(attributes: Attributes): boolean {
+  for (const [key, value] of Object.entries(attributes)) {
+    if (
+      value === true &&
+      (key === "zero_data_retention" || key.endsWith(".zero_data_retention"))
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+class ZeroDataRetentionSampler implements Sampler {
+  constructor(private readonly delegate: Sampler) {}
+
+  shouldSample(
+    ctx: Context,
+    traceId: string,
+    spanName: string,
+    spanKind: SpanKind,
+    attributes: Attributes,
+    links: Link[],
+  ): SamplingResult {
+    if (hasZeroDataRetentionAttribute(attributes)) {
+      markTraceZeroDataRetention(traceId);
+      return { decision: SamplingDecision.NOT_RECORD };
+    }
+
+    if (
+      isZeroDataRetentionContext(ctx) ||
+      zeroDataRetentionTraces.has(traceId)
+    ) {
+      return { decision: SamplingDecision.NOT_RECORD };
+    }
+
+    return this.delegate.shouldSample(
+      ctx,
+      traceId,
+      spanName,
+      spanKind,
+      attributes,
+      links,
+    );
+  }
+
+  toString(): string {
+    return `ZeroDataRetentionSampler(${this.delegate.toString()})`;
+  }
+}
+
+class ZeroDataRetentionSpanProcessor implements SpanProcessor {
+  constructor(private readonly delegate: SpanProcessor) {}
+
+  onStart(
+    span: Parameters<SpanProcessor["onStart"]>[0],
+    parentContext: Context,
+  ): void {
+    this.delegate.onStart(span, parentContext);
+  }
+
+  onEnd(span: ReadableSpan): void {
+    const traceId = span.spanContext().traceId;
+    if (hasZeroDataRetentionAttribute(span.attributes)) {
+      markTraceZeroDataRetention(traceId);
+      return;
+    }
+
+    if (zeroDataRetentionTraces.has(traceId)) {
+      return;
+    }
+
+    this.delegate.onEnd(span);
+  }
+
+  forceFlush(): Promise<void> {
+    return this.delegate.forceFlush();
+  }
+
+  shutdown(): Promise<void> {
+    return this.delegate.shutdown();
+  }
+}
+
+interface TracerProviderOptions {
+  exporter: SpanExporter;
+  serviceName: string;
+  serviceInstanceId?: string;
+}
+
+/**
+ * Builds the tracer provider used by every Firecrawl process: 100% sampling
+ * (respecting the sampled flag of a remote parent), ZDR filtering, and batched
+ * export. Callers decide whether to `register()` it globally.
+ */
+export function createTracerProvider(
+  options: TracerProviderOptions,
+): NodeTracerProvider {
+  const resource = defaultResource()
+    .merge(detectResources({ detectors: [envDetector] }))
+    .merge(
+      resourceFromAttributes({
+        [ATTR_SERVICE_NAME]: options.serviceName,
+        ...(options.serviceInstanceId
+          ? { "service.instance.id": options.serviceInstanceId }
+          : {}),
+      }),
+    );
+
+  return new NodeTracerProvider({
+    resource,
+    sampler: new ZeroDataRetentionSampler(
+      new ParentBasedSampler({ root: new AlwaysOnSampler() }),
+    ),
+    spanProcessors: [
+      new ZeroDataRetentionSpanProcessor(
+        new BatchSpanProcessor(options.exporter),
+      ),
+    ],
+  });
+}
+
+/**
+ * W3C trace context carrier, stored on queue jobs so a worker can continue the
+ * trace the API request started.
+ */
 export interface SerializedTraceContext {
-  traceParent?: string;
-  traceState?: string;
+  traceparent?: string;
+  tracestate?: string;
+  baggage?: string;
 }
 
 export function serializeTraceContext(): SerializedTraceContext {
   const carrier: Record<string, string> = {};
   propagation.inject(context.active(), carrier);
 
-  return {
-    traceParent: carrier.traceparent,
-    traceState: carrier.tracestate,
-  };
+  const serialized: SerializedTraceContext = {};
+  if (carrier.traceparent) serialized.traceparent = carrier.traceparent;
+  if (carrier.tracestate) serialized.tracestate = carrier.tracestate;
+  if (carrier.baggage) serialized.baggage = carrier.baggage;
+  return serialized;
 }
 
-function deserializeTraceContext(serialized: SerializedTraceContext): any {
-  if (!serialized.traceParent) {
-    return context.active();
+export async function withTraceContextAsync<T>(
+  serializedContext: SerializedTraceContext | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!serializedContext?.traceparent) {
+    return fn();
   }
 
   const carrier: Record<string, string> = {
-    traceparent: serialized.traceParent,
+    traceparent: serializedContext.traceparent,
   };
-
-  if (serialized.traceState) {
-    carrier.tracestate = serialized.traceState;
+  if (serializedContext.tracestate) {
+    carrier.tracestate = serializedContext.tracestate;
+  }
+  if (serializedContext.baggage) {
+    carrier.baggage = serializedContext.baggage;
   }
 
-  return propagation.extract(context.active(), carrier);
+  return context.with(propagation.extract(context.active(), carrier), fn);
 }
 
-// export function withTraceContext<T>(serializedContext: SerializedTraceContext, fn: () => T): T {
-//   const ctx = deserializeTraceContext(serializedContext);
-//   return context.with(ctx, fn);
-// }
+type SpanAttributeInput = Record<string, AttributeValue | null | undefined>;
 
-export async function withTraceContextAsync<T>(
-  serializedContext: SerializedTraceContext,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const ctx = deserializeTraceContext(serializedContext);
-  return context.with(ctx, fn);
+function cleanAttributes(
+  attributes: SpanAttributeInput | undefined,
+): Attributes | undefined {
+  if (!attributes) {
+    return undefined;
+  }
+
+  const cleaned: Attributes = {};
+  for (const [key, value] of Object.entries(attributes)) {
+    if (value !== undefined && value !== null) {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
 }
+
+// Spans marked failed by `recordSpanException`; `withSpan` keeps their error status.
+const erroredSpans = new WeakSet<Span>();
 
 interface SpanOptions {
-  attributes?: Attributes;
+  attributes?: SpanAttributeInput;
   kind?: SpanKind;
-}
-
-function startSpan(name: string, options?: SpanOptions): Span {
-  return tracer.startSpan(name, {
-    attributes: options?.attributes,
-    kind: options?.kind || SpanKind.INTERNAL,
-  });
+  /**
+   * Marks the span and everything started inside it as zero data retention:
+   * nothing is recorded or exported.
+   */
+  zeroDataRetention?: boolean;
 }
 
 export async function withSpan<T>(
@@ -75,99 +300,64 @@ export async function withSpan<T>(
   fn: (span: Span) => Promise<T>,
   options?: SpanOptions,
 ): Promise<T> {
-  const span = startSpan(name, options);
+  const tracer = trace.getTracer(TRACER_NAME);
 
-  try {
-    const result = await context.with(
-      trace.setSpan(context.active(), span),
-      () => fn(span),
-    );
-    span.setStatus({ code: SpanStatusCode.OK });
-    return result;
-  } catch (error) {
-    span.setStatus({
-      code: SpanStatusCode.ERROR,
-      message: error instanceof Error ? error.message : String(error),
-    });
-
-    if (error instanceof Error) {
-      span.recordException(error);
-    }
-
-    throw error;
-  } finally {
-    span.end();
-  }
+  return withZeroDataRetention(options?.zeroDataRetention, () =>
+    tracer.startActiveSpan(
+      name,
+      { kind: options?.kind, attributes: cleanAttributes(options?.attributes) },
+      async span => {
+        try {
+          const result = await fn(span);
+          if (!erroredSpans.has(span)) {
+            span.setStatus({ code: SpanStatusCode.OK });
+          }
+          return result;
+        } catch (error) {
+          recordSpanException(span, error);
+          throw error;
+        } finally {
+          span.end();
+        }
+      },
+    ),
+  );
 }
 
-// export function withSpanSync<T>(
-//   name: string,
-//   fn: (span: Span) => T,
-//   options?: SpanOptions
-// ): T {
-//   const span = startSpan(name, options);
-
-//   try {
-//     const result = context.with(
-//       trace.setSpan(context.active(), span),
-//       () => fn(span)
-//     );
-//     span.setStatus({ code: SpanStatusCode.OK });
-//     return result;
-//   } catch (error) {
-//     span.setStatus({
-//       code: SpanStatusCode.ERROR,
-//       message: error instanceof Error ? error.message : String(error),
-//     });
-
-//     if (error instanceof Error) {
-//       span.recordException(error);
-//     }
-
-//     throw error;
-//   } finally {
-//     span.end();
-//   }
-// }
-
-export function setSpanAttributes(span: Span, attributes: Attributes): void {
-  Object.entries(attributes).forEach(([key, value]) => {
-    if (value !== undefined && value !== null) {
-      span.setAttribute(key, value);
-    }
+/**
+ * Marks a span as failed and attaches the error as an exception event, for
+ * failures that are handled (returned) rather than thrown out of `withSpan`.
+ */
+export function recordSpanException(span: Span, error: unknown): void {
+  erroredSpans.add(span);
+  span.recordException(error instanceof Error ? error : String(error));
+  span.setStatus({
+    code: SpanStatusCode.ERROR,
+    message: error instanceof Error ? error.message : String(error),
   });
 }
 
-// export function setSpanError(span: Span, error: Error | unknown, logger?: Logger): void {
-//   const errorMessage = error instanceof Error ? error.message : String(error);
+export function setSpanAttributes(
+  span: Span,
+  attributes: SpanAttributeInput,
+): void {
+  const cleaned = cleanAttributes(attributes);
+  if (!cleaned) {
+    return;
+  }
 
-//   span.setStatus({
-//     code: SpanStatusCode.ERROR,
-//     message: errorMessage,
-//   });
+  span.setAttributes(cleaned);
 
-//   if (error instanceof Error) {
-//     span.recordException(error);
-//     span.setAttributes({
-//       'error.type': error.constructor.name,
-//       'error.message': error.message,
-//       'error.stack': error.stack,
-//     });
-//   }
-
-//   if (logger) {
-//     logger.error('Span error recorded', { error, spanName: span.spanContext().traceId });
-//   }
-// }
-
-// export function getActiveSpan(): Span | undefined {
-//   return trace.getActiveSpan();
-// }
-
-// export function createChildSpan(name: string, parentSpan?: Span, options?: SpanOptions): Span {
-//   const ctx = parentSpan
-//     ? trace.setSpan(context.active(), parentSpan)
-//     : context.active();
-
-//   return context.with(ctx, () => startSpan(name, options));
-// }
+  // Flagging a live, recording span as ZDR also covers everything started under
+  // it from now on, plus spans of the trace that are still in flight. A
+  // non-recording span needs no registry entry: its descendants are already
+  // dropped by parent-based sampling.
+  const spanContext = span.spanContext();
+  if (
+    span.isRecording() &&
+    hasZeroDataRetentionAttribute(cleaned) &&
+    isSpanContextValid(spanContext)
+  ) {
+    markTraceZeroDataRetention(spanContext.traceId);
+  }
+}

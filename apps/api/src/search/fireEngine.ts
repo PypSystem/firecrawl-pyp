@@ -1,14 +1,8 @@
-import dotenv from "dotenv";
+import { config } from "../config";
 import { SearchResult } from "../../src/lib/entities";
-import * as Sentry from "@sentry/node";
 import { logger } from "../lib/logger";
 import { executeWithRetry, attemptRequest } from "../lib/retry-utils";
-
-dotenv.config();
-
-const useFireEngine =
-  process.env.FIRE_ENGINE_BETA_URL !== "" &&
-  process.env.FIRE_ENGINE_BETA_URL !== undefined;
+import { useFireEngine } from "../scraper/scrapeURL/engines/fire-engine/available";
 
 function hasResults(results: unknown): results is SearchResult[] {
   return Array.isArray(results) && results.length > 0;
@@ -41,7 +35,7 @@ export async function fire_engine_search(
     page: options.page ?? 1,
   };
 
-  const url = `${process.env.FIRE_ENGINE_BETA_URL}/search`;
+  const url = `${config.FIRE_ENGINE_BETA_URL}/search`;
   const data = JSON.stringify(payload);
 
   const result = await executeWithRetry<SearchResult[]>(
@@ -83,7 +77,7 @@ export async function fireEngineMap(
     page: options.page ?? 1,
   };
 
-  const url = `${process.env.FIRE_ENGINE_BETA_URL}/map`;
+  const url = `${config.FIRE_ENGINE_BETA_URL}/map`;
   const data = JSON.stringify(payload);
 
   const result = await executeWithRetry<SearchResult[]>(

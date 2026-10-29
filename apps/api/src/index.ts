@@ -1,52 +1,66 @@
 import "dotenv/config";
-import { shutdownOtel } from "./otel";
-import "./services/sentry";
-import * as Sentry from "@sentry/node";
+import { config } from "./config";
+import { shutdownTracing } from "./otel";
 import express, { NextFunction, Request, Response } from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 import {
-  getExtractQueue,
   getGenerateLlmsTxtQueue,
   getDeepResearchQueue,
   getBillingQueue,
   getPrecrawlQueue,
+  getFirebillTrackRetryQueue,
 } from "./services/queue-service";
 import { v0Router } from "./routes/v0";
+import { startNodeRuntimeMetrics } from "./lib/node-runtime-metrics";
 import os from "os";
 import { logger } from "./lib/logger";
-import { adminRouter } from "./routes/admin";
+import {
+  adminInternalRouter,
+  adminRouter,
+  countAdminPathRoute,
+} from "./routes/admin";
 import http from "node:http";
 import https from "node:https";
 import { v1Router } from "./routes/v1";
 import expressWs from "express-ws";
-import {
-  ErrorResponse,
-  RequestWithMaybeACUC,
-  ResponseWithSentry,
-} from "./controllers/v1/types";
+import { ErrorResponse, RequestWithMaybeACUC } from "./controllers/v1/types";
 import { ZodError } from "zod";
-import { v4 as uuidv4 } from "uuid";
-import { attachWsProxy } from "./services/agentLivecastWS";
+import { QueueFullError } from "./lib/queue-full-error";
+import { v7 as uuidv7 } from "uuid";
 import { cacheableLookup } from "./scraper/scrapeURL/lib/cacheableLookup";
 import { v2Router } from "./routes/v2";
-import domainFrequencyRouter from "./routes/domain-frequency";
+import { exchangeRouter } from "./routes/exchange";
+import { labsRouter } from "./routes/labs";
+import { registerMcpActionLogIngestRoute } from "./routes/mcp-action-logs";
 import { nuqShutdown } from "./services/worker/nuq";
 import { getErrorContactMessage } from "./lib/deployment";
 import { initializeBlocklist } from "./scraper/WebScraper/utils/blocklist";
+import { warmExchangeCatalog } from "./lib/exchange";
 import { initializeEngineForcing } from "./scraper/WebScraper/utils/engine-forcing";
 import responseTime from "response-time";
+import { shutdownWebhookQueue } from "./services/webhook";
+import { shutdownIndexerQueue } from "./services/indexing/indexer-queue";
+import { isKeylessConfigured } from "./lib/keyless";
+import { shutdownPubSubLogging } from "./services/logging/log_job";
+import { notFoundHandler } from "./lib/not-found";
 
 const { createBullBoard } = require("@bull-board/api");
 const { BullMQAdapter } = require("@bull-board/api/bullMQAdapter");
 const { ExpressAdapter } = require("@bull-board/express");
 
-const numCPUs = process.env.ENV === "local" ? 2 : os.cpus().length;
+const numCPUs = config.ENV === "local" ? 2 : os.cpus().length;
 logger.info(`Number of CPUs: ${numCPUs} available`);
 
 logger.info("Network info dump", {
   networkInterfaces: os.networkInterfaces(),
 });
+
+if (isKeylessConfigured() && !config.KEYLESS_CONVERSION_HMAC_SECRET) {
+  logger.warn(
+    "Keyless conversion cohort logging is disabled: set KEYLESS_CONVERSION_HMAC_SECRET to enable privacy-safe quota-to-account measurement",
+  );
+}
 
 // Install cacheable lookup for all other requests
 cacheableLookup.install(http.globalAgent);
@@ -57,96 +71,190 @@ const expressApp = express();
 const ws = expressWs(expressApp);
 const app = ws.app;
 
-global.isProduction = process.env.IS_PRODUCTION === "true";
+global.isProduction = config.IS_PRODUCTION;
 
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json({ limit: "10mb" }));
+// Capture the exact request bytes so integrations that sign the raw payload
+// (e.g. Slack's X-Slack-Signature) can verify it after body parsing. Typed with
+// the node http types body-parser's `verify` hook expects.
+const captureRawBody = (
+  req: http.IncomingMessage,
+  _res: http.ServerResponse,
+  buf: Buffer,
+) => {
+  if (buf && buf.length) {
+    (req as http.IncomingMessage & { rawBody?: Buffer }).rawBody = buf;
+  }
+};
+
+registerMcpActionLogIngestRoute(app);
+
+app.use(bodyParser.urlencoded({ extended: true, verify: captureRawBody }));
+app.use(bodyParser.json({ limit: "10mb", verify: captureRawBody }));
 
 app.use(cors()); // Add this line to enable CORS
 
 app.use(responseTime());
 
-if (process.env.EXPRESS_TRUST_PROXY) {
-  app.set("trust proxy", parseInt(process.env.EXPRESS_TRUST_PROXY, 10));
+app.disable("x-powered-by");
+
+if (config.EXPRESS_TRUST_PROXY) {
+  app.set("trust proxy", config.EXPRESS_TRUST_PROXY);
 }
 
 const serverAdapter = new ExpressAdapter();
-serverAdapter.setBasePath(`/admin/${process.env.BULL_AUTH_KEY}/queues`);
+
+const bullBoardQueues = [
+  new BullMQAdapter(getGenerateLlmsTxtQueue()),
+  new BullMQAdapter(getDeepResearchQueue()),
+  new BullMQAdapter(getBillingQueue()),
+  new BullMQAdapter(getPrecrawlQueue()),
+  new BullMQAdapter(getFirebillTrackRetryQueue()),
+  // SIEM audit delivery runs on RabbitMQ; inspect it in the broker's
+  // management UI, not here.
+];
 
 const { addQueue, removeQueue, setQueues, replaceQueues } = createBullBoard({
-  queues: [
-    new BullMQAdapter(getExtractQueue()),
-    new BullMQAdapter(getGenerateLlmsTxtQueue()),
-    new BullMQAdapter(getDeepResearchQueue()),
-    new BullMQAdapter(getBillingQueue()),
-    new BullMQAdapter(getPrecrawlQueue()),
-  ],
+  queues: bullBoardQueues,
   serverAdapter: serverAdapter,
 });
 
-app.use(
-  `/admin/${process.env.BULL_AUTH_KEY}/queues`,
-  serverAdapter.getRouter(),
-);
+if (!config.BULL_AUTH_KEY) {
+  logger.warn("BULL_AUTH_KEY is not set; admin routes are disabled.");
+} else if (config.BULL_AUTH_KEY_PATH_ROUTES) {
+  serverAdapter.setBasePath(`/admin/${config.BULL_AUTH_KEY}/queues`);
+  app.use(
+    `/admin/${config.BULL_AUTH_KEY}/queues`,
+    countAdminPathRoute("queues"),
+    serverAdapter.getRouter(),
+  );
+}
 
-app.get("/", (req, res) => {
-  res.send("SCRAPERS-JS: Hello, world! K8s!");
+app.get("/", (_, res) => {
+  res.json({
+    message: "Firecrawl API",
+    documentation_url: "https://docs.firecrawl.dev",
+  });
 });
 
-//write a simple test function
-app.get("/test", async (req, res) => {
-  res.send("Hello, world!");
+app.get("/e2e-test", (_, res) => {
+  res.status(200).send("OK");
 });
 
 // register router
 app.use(v0Router);
 app.use("/v1", v1Router);
 app.use("/v2", v2Router);
+app.use("/labs", labsRouter);
+app.use("/exchange", exchangeRouter);
 app.use(adminRouter);
-app.use(domainFrequencyRouter);
 
-const DEFAULT_PORT = process.env.PORT ?? 3002;
-const HOST = process.env.HOST ?? "localhost";
+const DEFAULT_PORT = config.PORT;
+const HOST = config.HOST;
+
+// The internal listener has no key check: keep its port off public ingress.
+function startAdminInternalServer(port: number) {
+  const adminApp = express();
+  adminApp.disable("x-powered-by");
+  adminApp.use(bodyParser.json({ limit: "10mb" }));
+
+  const internalBullBoard = new ExpressAdapter();
+  internalBullBoard.setBasePath("/admin/queues");
+  createBullBoard({
+    queues: bullBoardQueues,
+    serverAdapter: internalBullBoard,
+  });
+  adminApp.use("/admin/queues", internalBullBoard.getRouter());
+
+  adminApp.use(adminInternalRouter);
+  adminApp.use(notFoundHandler);
+  adminApp.use(
+    (err: unknown, req: Request, res: Response, _next: NextFunction) => {
+      logger.error("Internal admin request failed", {
+        error: err,
+        path: req.path,
+      });
+      res.status(500).json({ success: false, error: "Internal server error" });
+    },
+  );
+
+  const host = config.ADMIN_INTERNAL_HOST;
+  return adminApp.listen(port, host, (error?: Error) => {
+    if (error) {
+      logger.error("Failed to start internal admin server", {
+        error,
+        port,
+        host,
+      });
+      throw error;
+    }
+
+    logger.info("Internal admin server listening", {
+      pid: process.pid,
+      port,
+      host,
+    });
+  });
+}
 
 async function startServer(port = DEFAULT_PORT) {
+  startNodeRuntimeMetrics();
   try {
     await initializeBlocklist();
     initializeEngineForcing();
+    warmExchangeCatalog();
   } catch (error) {
-    logger.error("Failed to initialize blocklist and engine forcing", {
+    logger.error("Failed to initialize API startup dependencies", {
       error,
     });
     throw error;
   }
 
-  // Attach WebSocket proxy to the Express app
-  attachWsProxy(app);
+  const server = app.listen(Number(port), HOST, (error?: Error) => {
+    if (error) {
+      logger.error("Failed to start HTTP server", { error, port, host: HOST });
+      throw error;
+    }
 
-  const server = app.listen(Number(port), HOST, () => {
     logger.info(`Worker ${process.pid} listening on port ${port}`);
   });
 
+  const adminInternalServer =
+    config.ADMIN_INTERNAL_PORT !== undefined
+      ? startAdminInternalServer(config.ADMIN_INTERNAL_PORT)
+      : undefined;
+
   const exitHandler = async () => {
     logger.info("SIGTERM signal received: closing HTTP server");
-    if (process.env.IS_KUBERNETES === "true") {
+    if (config.IS_KUBERNETES) {
       // Account for GCE load balancer drain timeout
       logger.info("Waiting 60s for GCE load balancer drain timeout");
       await new Promise(resolve => setTimeout(resolve, 60000));
     }
-    server.close(() => {
+    const adminInternalClosed = new Promise<void>(resolve =>
+      adminInternalServer
+        ? adminInternalServer.close(() => resolve())
+        : resolve(),
+    );
+    server.close(async () => {
+      await adminInternalClosed;
       logger.info("Server closed.");
       nuqShutdown().finally(() => {
-        logger.info("NUQ shutdown complete");
-        shutdownOtel().finally(() => {
-          logger.info("OTEL shutdown");
-          process.exit(0);
+        shutdownWebhookQueue().finally(() => {
+          shutdownIndexerQueue().finally(async () => {
+            await shutdownPubSubLogging();
+            await shutdownTracing();
+            logger.info("NUQ shutdown complete");
+            process.exit(0);
+          });
         });
       });
     });
   };
 
-  process.on("SIGTERM", exitHandler);
-  process.on("SIGINT", exitHandler);
+  if (require.main === module) {
+    process.on("SIGTERM", exitHandler);
+    process.on("SIGINT", exitHandler);
+  }
   return server;
 }
 
@@ -161,6 +269,10 @@ app.get("/is-production", (req, res) => {
   res.send({ isProduction: global.isProduction });
 });
 
+// Terminal handler for unmatched paths. Must stay after every route and before
+// the error middleware below, or Express falls back to its default HTML page.
+app.use(notFoundHandler);
+
 app.use(
   (
     err: unknown,
@@ -168,24 +280,40 @@ app.use(
     res: Response<ErrorResponse>,
     next: NextFunction,
   ) => {
-    if (err instanceof ZodError) {
+    if (err instanceof QueueFullError) {
+      res.status(429).json({
+        success: false,
+        error: err.message,
+      });
+    } else if (err instanceof ZodError) {
+      // In zod v4, ZodError uses 'issues' instead of 'errors'
+      const issues = err.issues;
+
       if (
-        Array.isArray(err.errors) &&
-        err.errors.find(x => x.message === "URL uses unsupported protocol")
+        Array.isArray(issues) &&
+        issues.find(x => x.message === "URL uses unsupported protocol")
       ) {
         logger.warn("Unsupported protocol error: " + JSON.stringify(req.body));
       }
 
-      const customErrorMessage =
-        err.errors.length > 0 && err.errors[0].code === "custom"
-          ? err.errors[0].message
+      // Check for unrecognized_keys errors and replace with custom message
+      const hasUnrecognizedKeys = issues.some(
+        e => e.code === "unrecognized_keys",
+      );
+      const strictMessage =
+        "Unrecognized key in body -- please review the v2 API documentation for request body changes";
+
+      const customErrorMessage = hasUnrecognizedKeys
+        ? strictMessage
+        : issues.length > 0 && issues[0].code === "custom"
+          ? issues[0].message
           : "Bad Request";
 
       res.status(400).json({
         success: false,
         code: "BAD_REQUEST",
         error: customErrorMessage,
-        details: err.errors,
+        details: issues,
       });
     } else {
       next(err);
@@ -193,13 +321,11 @@ app.use(
   },
 );
 
-Sentry.setupExpressErrorHandler(app);
-
 app.use(
   (
     err: unknown,
     req: RequestWithMaybeACUC<{}, ErrorResponse, undefined>,
-    res: ResponseWithSentry<ErrorResponse>,
+    res: Response<ErrorResponse>,
     next: NextFunction,
   ) => {
     if (
@@ -214,8 +340,19 @@ app.use(
         error: "Bad request, malformed JSON",
       });
     }
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      "status" in err &&
+      (err as { status?: number }).status === 413
+    ) {
+      return res.status(413).json({
+        success: false,
+        error: "Request body is too large",
+      });
+    }
 
-    const id = res.sentry ?? uuidv4();
+    const id = uuidv7();
 
     logger.error(
       "Error occurred in request! (" + req.path + ") -- ID " + id + " -- ",

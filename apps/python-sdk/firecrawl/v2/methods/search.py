@@ -2,10 +2,10 @@
 Search functionality for Firecrawl v2 API.
 """
 
-import re
 from typing import Dict, Any, Union, List, TypeVar, Type
-from ..types import SearchRequest, SearchData, Document, SearchResultWeb, SearchResultNews, SearchResultImages
-from ..utils.normalize import normalize_document_input
+from ..types import SearchRequest, SearchData, Document, SearchResultWeb, SearchResultNews, SearchResultImages, DiscoveredTool
+from ..utils.agent_hints import agent_hint_metadata
+from ..utils.normalize import normalize_document_input, _map_search_result_keys
 from ..utils import HttpClient, handle_response_error, validate_scrape_options, prepare_scrape_options
 
 T = TypeVar("T")
@@ -36,19 +36,20 @@ def search(
         if not response_data.get("success"):
             handle_response_error(response, "search")
         data = response_data.get("data", {}) or {}
-        out = SearchData()
+        out = SearchData(warning=response_data.get("warning"), **agent_hint_metadata(response_data))
         if "web" in data:
             out.web = _transform_array(data["web"], SearchResultWeb)
         if "news" in data:
             out.news = _transform_array(data["news"], SearchResultNews)
         if "images" in data:
             out.images = _transform_array(data["images"], SearchResultImages)
+        if "tools" in data:
+            out.tools = [DiscoveredTool(**item) for item in data["tools"]]
         return out
     except Exception as err:
-        # If the error is an HTTP error from requests, handle it
-        # (simulate isAxiosError by checking for requests' HTTPError or Response)
-        if hasattr(err, "response"):
-            handle_response_error(getattr(err, "response"), "search")
+        response = getattr(err, "response", None)
+        if response is not None:
+            handle_response_error(response, "search")
         raise err
 
 def _transform_array(arr: List[Any], result_type: Type[T]) -> List[Union[T, 'Document']]:
@@ -73,9 +74,20 @@ def _transform_array(arr: List[Any], result_type: Type[T]) -> List[Union[T, 'Doc
             ):
                 results.append(Document(**normalize_document_input(item)))
             else:
-                results.append(result_type(**item))
+                result_type_name = None
+                if result_type == SearchResultImages:
+                    result_type_name = "images"
+                elif result_type == SearchResultNews:
+                    result_type_name = "news"
+                elif result_type == SearchResultWeb:
+                    result_type_name = "web"
+
+                if result_type_name:
+                    normalized_item = _map_search_result_keys(item, result_type_name)
+                    results.append(result_type(**normalized_item))
+                else:
+                    results.append(result_type(**item))
         else:
-            # For non-dict items, assume it's a URL and wrap in result_type
             results.append(result_type(url=item))
     return results
 
@@ -112,7 +124,7 @@ def _validate_search_request(request: SearchRequest) -> SearchRequest:
     
     # Validate sources (if provided)
     if request.sources is not None:
-        valid_sources = {"web", "news", "images"}
+        valid_sources = {"web", "news", "images", "alexandria"}
         for source in request.sources:
             if isinstance(source, str):
                 if source not in valid_sources:
@@ -123,7 +135,7 @@ def _validate_search_request(request: SearchRequest) -> SearchRequest:
     
     # Validate categories (if provided)
     if request.categories is not None:
-        valid_categories = {"github", "research", "pdf"}
+        valid_categories = {"github", "research", "pdf", "developer", "gov"}
         for category in request.categories:
             if isinstance(category, str):
                 if category not in valid_categories:
@@ -131,6 +143,11 @@ def _validate_search_request(request: SearchRequest) -> SearchRequest:
             elif hasattr(category, 'type'):
                 if category.type not in valid_categories:
                     raise ValueError(f"Invalid category type: {category.type}. Valid types: {valid_categories}")
+
+    if request.include_domains and request.exclude_domains:
+        raise ValueError(
+            "include_domains and exclude_domains cannot both be specified"
+        )
     
     # Validate location (if provided)
     if request.location is not None:
@@ -139,19 +156,8 @@ def _validate_search_request(request: SearchRequest) -> SearchRequest:
     
     # Validate tbs (time-based search, if provided)
     if request.tbs is not None:
-        valid_tbs_values = {
-            "qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y",  # Google time filters
-            "d", "w", "m", "y"  # Short forms
-        }
-        
-        if request.tbs in valid_tbs_values:
-            pass  # Valid predefined value
-        elif request.tbs.startswith("cdr:"):
-            custom_date_pattern = r"^cdr:1,cd_min:\d{1,2}/\d{1,2}/\d{4},cd_max:\d{1,2}/\d{1,2}/\d{4}$"
-            if not re.match(custom_date_pattern, request.tbs):
-                raise ValueError(f"Invalid custom date range format: {request.tbs}. Expected format: cdr:1,cd_min:MM/DD/YYYY,cd_max:MM/DD/YYYY")
-        else:
-            raise ValueError(f"Invalid tbs value: {request.tbs}. Valid values: {valid_tbs_values} or custom date range format: cdr:1,cd_min:MM/DD/YYYY,cd_max:MM/DD/YYYY")
+        if not isinstance(request.tbs, str) or len(request.tbs.strip()) == 0:
+            raise ValueError("tbs must be a non-empty string")
     
     # Validate scrape_options (if provided)
     if request.scrape_options is not None:
@@ -186,7 +192,24 @@ def _prepare_search_request(request: SearchRequest) -> Dict[str, Any]:
     if validated_request.ignore_invalid_urls is not None:
         data["ignoreInvalidURLs"] = validated_request.ignore_invalid_urls
         data.pop("ignore_invalid_urls", None)
+
+    # include_domains → includeDomains
+    if validated_request.include_domains is not None:
+        data["includeDomains"] = validated_request.include_domains
+        data.pop("include_domains", None)
+
+    # exclude_domains → excludeDomains
+    if validated_request.exclude_domains is not None:
+        data["excludeDomains"] = validated_request.exclude_domains
+        data.pop("exclude_domains", None)
     
+    # threat_protection → threatProtection
+    if validated_request.threat_protection is not None:
+        data["threatProtection"] = validated_request.threat_protection.model_dump(
+            by_alias=True, exclude_none=True
+        )
+        data.pop("threat_protection", None)
+
     # scrape_options → scrapeOptions
     if validated_request.scrape_options is not None:
         scrape_data = prepare_scrape_options(validated_request.scrape_options)

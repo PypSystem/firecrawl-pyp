@@ -1,4 +1,3 @@
-import * as Sentry from "@sentry/node";
 import { logger } from "./logger";
 
 const RETRY_DELAYS = [500, 1500, 3000] as const;
@@ -11,6 +10,7 @@ export async function attemptRequest<T>(
   url: string,
   data: string,
   abort?: AbortSignal,
+  requestId?: string,
 ): Promise<T | null> {
   try {
     const response = await fetch(url, {
@@ -18,6 +18,7 @@ export async function attemptRequest<T>(
       headers: {
         "Content-Type": "application/json",
         "X-Disable-Cache": "true",
+        ...(requestId ? { "X-Request-ID": requestId } : {}),
       },
       body: data,
       signal: abort,
@@ -45,7 +46,6 @@ export async function attemptRequest<T>(
     }
   } catch (error) {
     logger.error("Fire Engine API request failed:", error);
-    Sentry.captureException(error);
   }
   return null;
 }
@@ -54,7 +54,7 @@ export async function attemptRequest<T>(
  * Abortable sleep function that resolves immediately if the signal is aborted
  */
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return new Promise(resolve => {
     if (signal?.aborted) {
       resolve();
       return;
@@ -105,7 +105,6 @@ export async function executeWithRetry<T>(
       }
 
       logger.error(`Attempt ${attempt + 1} failed:`, error);
-      Sentry.captureException(error);
     }
 
     // Wait before retry (except on last attempt)

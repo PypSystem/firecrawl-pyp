@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { webhookSchema } from "./schema";
-import { ExtractResult } from "../../lib/extract/extraction-service";
+import { ExtractResult } from "../../lib/extract/types";
 import { Document } from "../../controllers/v2/types";
 
 export enum WebhookEvent {
@@ -13,6 +13,8 @@ export enum WebhookEvent {
   EXTRACT_STARTED = "extract.started",
   EXTRACT_COMPLETED = "extract.completed",
   EXTRACT_FAILED = "extract.failed",
+  MONITOR_PAGE = "monitor.page",
+  MONITOR_CHECK_COMPLETED = "monitor.check.completed",
 }
 
 export type WebhookEventDataMap = {
@@ -25,9 +27,31 @@ export type WebhookEventDataMap = {
   [WebhookEvent.EXTRACT_STARTED]: ExtractStartedData;
   [WebhookEvent.EXTRACT_COMPLETED]: ExtractCompletedData;
   [WebhookEvent.EXTRACT_FAILED]: ExtractFailedData;
+  [WebhookEvent.MONITOR_PAGE]: MonitorPageData;
+  [WebhookEvent.MONITOR_CHECK_COMPLETED]: MonitorCheckCompletedData;
 };
 
 export type WebhookConfig = z.infer<typeof webhookSchema>;
+
+export type WebhookQueueMessage = {
+  webhook_url: string;
+  payload: {
+    success: boolean;
+    type: string;
+    webhookId: string;
+    id?: string;
+    jobId?: string;
+    data: any;
+    error?: string;
+    metadata?: Record<string, string>;
+  };
+  headers: Record<string, string>;
+  team_id: string;
+  job_id: string;
+  scrape_id: string | null;
+  event: WebhookEvent;
+  timeout_ms: number;
+};
 
 interface WebhookDocument {
   content?: string;
@@ -92,4 +116,57 @@ interface ExtractCompletedData extends BaseWebhookData {
 interface ExtractFailedData extends BaseWebhookData {
   success: false;
   error: string;
+}
+
+// monitor
+interface MonitorPageJudgment {
+  meaningful: boolean;
+  confidence: "high" | "medium" | "low";
+  reason: string;
+  meaningfulChanges: Array<{
+    type: "added" | "removed" | "changed";
+    before: string | null;
+    after: string | null;
+    reason: string;
+  }>;
+}
+
+interface MonitorPageDiff {
+  text?: string;
+  json?: Record<string, { previous: unknown; current: unknown }>;
+}
+
+interface MonitorPageData extends BaseWebhookData {
+  success: boolean;
+  data: {
+    monitorId: string;
+    checkId: string;
+    url: string;
+    status: string;
+    previousScrapeId?: string | null;
+    currentScrapeId?: string | null;
+    error?: string | null;
+    isMeaningful: boolean | null;
+    judgment?: MonitorPageJudgment | null;
+    diff?: MonitorPageDiff | null;
+  }[];
+  error?: string;
+}
+
+interface MonitorCheckCompletedData extends BaseWebhookData {
+  success: boolean;
+  data: {
+    monitorId: string;
+    checkId: string;
+    status: string;
+    summary: {
+      totalPages: number;
+      same: number;
+      changed: number;
+      new: number;
+      removed: number;
+      error: number;
+    };
+  }[];
+  error?: string;
 }

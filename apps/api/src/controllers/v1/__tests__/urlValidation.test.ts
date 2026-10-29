@@ -1,9 +1,9 @@
 import { url } from "../types";
-import { BLOCKLISTED_URL_MESSAGE } from "../../../lib/strings";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../../lib/strings";
 
 describe("URL Schema Validation", () => {
   beforeEach(() => {
-    jest.resetAllMocks();
+    vi.resetAllMocks();
   });
 
   it("should prepend http:// to URLs without a protocol", () => {

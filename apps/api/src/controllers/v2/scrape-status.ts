@@ -1,18 +1,29 @@
-import { supabaseGetJobByIdOnlyData } from "../../lib/supabase-jobs";
 import { getJob } from "./crawl-status";
 import { logger as _logger } from "../../lib/logger";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { getScrapeJobAccess } from "../../lib/operational-job-access";
+import { normalizeJobAccessTeamId } from "../../lib/job-access-store";
 
 export async function scrapeStatusController(req: any, res: any) {
+  const uuidReg =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!req.params.jobId || !uuidReg.test(req.params.jobId)) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid crawl ID",
+    });
+  }
+
   const logger = _logger.child({
     module: "scrape-status",
     method: "scrapeStatusController",
     teamId: req.auth.team_id,
     jobId: req.params.jobId,
     scrapeId: req.params.jobId,
-    zeroDataRetention: req.acuc?.flags?.forceZDR,
+    zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
   });
 
-  if (req.acuc?.flags?.forceZDR) {
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
     return res.status(400).json({
       success: false,
       error:
@@ -20,16 +31,18 @@ export async function scrapeStatusController(req: any, res: any) {
     });
   }
 
-  const job = await supabaseGetJobByIdOnlyData(req.params.jobId, logger);
+  const access = await getScrapeJobAccess(req.params.jobId);
 
-  if (!job) {
+  if (!access || access.expiresAtMs <= Date.now()) {
     return res.status(404).json({
       success: false,
       error: "Job not found.",
     });
   }
 
-  if (job?.team_id !== req.auth.team_id) {
+  // Access rows store the normalized team (preview and keyless callers map to
+  // a placeholder UUID), so compare against the same normalization.
+  if (access.teamId !== normalizeJobAccessTeamId(req.auth.team_id)) {
     return res.status(403).json({
       success: false,
       error: "You are not allowed to access this resource.",

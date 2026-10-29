@@ -79,16 +79,35 @@ jobs:
           EOF
 
       # ==========================================
-      # 4. Pull das imagens Docker oficiais
+      # 4. Build das imagens Docker a partir do fork
       # ==========================================
-      - name: Pull official Docker images
-        run: |
-          docker pull ghcr.io/firecrawl/firecrawl:latest
-          docker pull ghcr.io/firecrawl/playwright-service:latest
+      # Não usar `ghcr.io/firecrawl/*:latest`: o upstream removeu o screenshot do engine
+      # playwright e do playwright-service, e o Studio depende dele para ler referências.
+      # O build compila Go e Rust; o cache de camadas evita refazer isso a cada deploy.
+      - name: Build API Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/api
+          file: apps/api/Dockerfile
+          build-args: GIT_SHA=${{ github.sha }}
+          load: true
+          tags: |
+            firecrawl-api:latest
+            firecrawl-api:${{ github.sha }}
+          cache-from: type=gha,scope=firecrawl-api
+          cache-to: type=gha,mode=max,scope=firecrawl-api
 
-          # Tag para nosso padrão
-          docker tag ghcr.io/firecrawl/firecrawl:latest firecrawl-api:latest
-          docker tag ghcr.io/firecrawl/playwright-service:latest firecrawl-playwright:latest
+      - name: Build Playwright Service Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/playwright-service-ts
+          file: apps/playwright-service-ts/Dockerfile
+          load: true
+          tags: |
+            firecrawl-playwright:latest
+            firecrawl-playwright:${{ github.sha }}
+          cache-from: type=gha,scope=firecrawl-playwright
+          cache-to: type=gha,mode=max,scope=firecrawl-playwright
 
       - name: Build NUQ Postgres Docker image
         run: |

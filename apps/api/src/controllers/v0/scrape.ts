@@ -1,9 +1,13 @@
 import { ExtractorOptions, PageOptions } from "./../../lib/entities";
 import { Request, Response } from "express";
-import { checkTeamCredits } from "../../services/billing/credit_billing";
+import { autumnService } from "../../services/autumn/autumn.service";
 import { authenticateUser } from "../auth";
-import { RateLimiterMode } from "../../types";
-import { TeamFlags, toLegacyDocument, url as urlSchema } from "../v1/types";
+import { RateLimiterMode, AuthResponse } from "../../types";
+import {
+  AuthCreditUsageChunk,
+  toLegacyDocument,
+  url as urlSchema,
+} from "../v1/types";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist"; // Import the isUrlBlocked function
 import {
   defaultPageOptions,
@@ -13,17 +17,28 @@ import {
 } from "../../lib/default-values";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
 import { redisEvictConnection } from "../../../src/services/redis";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { logger } from "../../lib/logger";
-import * as Sentry from "@sentry/node";
 import { getJobPriority } from "../../lib/job-priority";
 import { ZodError } from "zod";
 import { Document as V0Document } from "./../../lib/entities";
-import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { fromV0Combo } from "../v2/types";
 import { ScrapeJobTimeoutError } from "../../lib/error";
-import { scrapeQueue } from "../../services/worker/nuq";
+import { scrapeQueue } from "../../services/worker/nuq-router";
 import { getErrorContactMessage } from "../../lib/deployment";
+import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
+import {
+  isThreatProtectionForced,
+  THREAT_PROTECTION_V0_UNSUPPORTED_MESSAGE,
+} from "../../lib/threat-protection/request";
+import {
+  getSafeMode,
+  SAFE_MODE_V0_UNSUPPORTED_MESSAGE,
+} from "../../lib/safe-mode";
+import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 
 async function scrapeHelper(
   jobId: string,
@@ -33,23 +48,42 @@ async function scrapeHelper(
   pageOptions: PageOptions,
   extractorOptions: ExtractorOptions,
   timeout: number,
-  flags: TeamFlags,
-  apiKeyId: number | null,
+  acuc: AuthCreditUsageChunk | null,
 ): Promise<{
   success: boolean;
   error?: string;
   data?: V0Document | { url: string };
   returnCode: number;
 }> {
-  const url = urlSchema.parse(req.body.url);
+  let url: string;
+  try {
+    url = urlSchema.parse(req.body.url);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      const errorMessage =
+        error.issues
+          .map(issue => issue.message)
+          .filter((msg, idx, arr) => arr.indexOf(msg) === idx)
+          .join("; ") || "Invalid URL";
+
+      return { success: false, error: errorMessage, returnCode: 400 };
+    }
+    throw error;
+  }
   if (typeof url !== "string") {
     return { success: false, error: "Url is required", returnCode: 400 };
   }
 
-  if (isUrlBlocked(url, flags)) {
+  if (
+    isUrlBlocked(url, acuc?.flags ?? null, {
+      team_id,
+      org_id: acuc?.org_id ?? null,
+      origin: req.body?.origin ?? null,
+    })
+  ) {
     return {
       success: false,
-      error: BLOCKLISTED_URL_MESSAGE,
+      error: UNSUPPORTED_SITE_MESSAGE,
       returnCode: 403,
     };
   }
@@ -62,6 +96,7 @@ async function scrapeHelper(
     team_id,
   );
 
+  internalOptions.orgId = acuc?.org_id ?? null;
   internalOptions.saveScrapeResultToGCS = process.env
     .GCS_FIRE_ENGINE_BUCKET_NAME
     ? true
@@ -76,12 +111,17 @@ async function scrapeHelper(
       internalOptions,
       origin: req.body.origin ?? defaultOrigin,
       integration: req.body.integration,
+      billing: {
+        endpoint: "scrape",
+        jobId,
+        externalRequestId: externalRequestId(req),
+      },
       startTime: Date.now(),
       zeroDataRetention: false, // not supported on v0
-      apiKeyId,
+      apiKeyId: acuc?.api_key_id ?? null,
     },
     jobId,
-    await getJobPriority({ team_id, basePriority: 10 }),
+    await getJobPriority({ team_id, acuc, basePriority: 10 }),
     false,
     true,
   );
@@ -164,19 +204,45 @@ export async function scrapeController(req: Request, res: Response) {
     // make sure to authenticate user first, Bearer <token>
     const auth = await authenticateUser(req, res, RateLimiterMode.Scrape);
     if (!auth.success) {
+      if (auth.status === 401) applyAgentAuthDiscoveryHeader(res);
       return res.status(auth.status).json({ error: auth.error });
     }
 
     const { team_id, chunk } = auth;
 
-    if (chunk?.flags?.forceZDR) {
+    if (getScrapeZDR(chunk?.flags) === "forced") {
       return res.status(400).json({
         error:
           "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
       });
     }
 
-    const jobId = uuidv4();
+    if (isThreatProtectionForced(chunk?.flags)) {
+      return res.status(403).json({
+        error: THREAT_PROTECTION_V0_UNSUPPORTED_MESSAGE,
+      });
+    }
+
+    if (getSafeMode(chunk?.flags)) {
+      return res.status(403).json({
+        error: SAFE_MODE_V0_UNSUPPORTED_MESSAGE,
+      });
+    }
+
+    const jobId = uuidv7();
+
+    await logRequest({
+      id: jobId,
+      kind: "scrape",
+      api_version: "v0",
+      external_request_id: externalRequestId(req),
+      team_id,
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      target_hint: req.body.url ?? "",
+      zeroDataRetention: false, // not supported on v0
+      api_key_id: chunk?.api_key_id ?? null,
+    });
 
     redisEvictConnection.sadd("teams_using_v0", team_id).catch(error =>
       logger.error("Failed to add team to teams_using_v0", {
@@ -218,11 +284,24 @@ export async function scrapeController(req: Request, res: Response) {
       timeout = req.body.timeout ?? 90000;
     }
 
-    // checkCredits
+    // checkCredits — Autumn is the source of truth for credits.
     try {
-      const { success: creditsCheckSuccess, message: creditsCheckMessage } =
-        await checkTeamCredits(chunk, team_id, 1);
-      if (!creditsCheckSuccess) {
+      // No org, no Autumn customer to gate against: fail open, exactly as
+      // checkCredits answered for an identity it could not name.
+      const orgId = chunk?.org_id ?? null;
+      const autumnResult = orgId
+        ? await autumnService.checkCredits({
+            teamId: team_id,
+            orgId,
+            value: 1,
+            properties: {
+              source: "v0/scrape",
+              apiKeyId: chunk?.api_key_id ?? null,
+            },
+          })
+        : null;
+      // null = Autumn unavailable / self-hosted -> fail open, matching v1/v2.
+      if (autumnResult !== null && !autumnResult.allowed) {
         earlyReturn = true;
         return res.status(402).json({
           error:
@@ -245,8 +324,7 @@ export async function scrapeController(req: Request, res: Response) {
       pageOptions,
       extractorOptions,
       timeout,
-      chunk?.flags ?? null,
-      chunk?.api_key_id ?? null,
+      chunk,
     );
 
     let doc = result.data;
@@ -264,7 +342,6 @@ export async function scrapeController(req: Request, res: Response) {
 
     return res.status(result.returnCode).json(result);
   } catch (error) {
-    Sentry.captureException(error);
     logger.error("Scrape error occcurred", { error });
     return res.status(500).json({
       error:
