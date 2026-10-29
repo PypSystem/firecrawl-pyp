@@ -10,6 +10,7 @@
  */
 
 import { Document } from "../../../controllers/v1/types";
+import { config } from "../../../config";
 import { indexDocumentIfEnabled } from "../../../lib/search-index-client";
 import { logger as _logger } from "../../../lib/logger";
 import { Meta } from "..";
@@ -18,7 +19,21 @@ import { Meta } from "..";
  * Check if document should be indexed for search
  */
 function shouldIndexForSearch(meta: Meta, document: Document): boolean {
+  if (meta.internalOptions.isParse) {
+    return false;
+  }
+
   if (meta.internalOptions.zeroDataRetention) {
+    return false;
+  }
+
+  // Exchange-delivered content is never stored on the Firecrawl side.
+  if (meta.winnerEngine === "exchange") {
+    return false;
+  }
+
+  // Lockdown must not forward the target URL to any external service.
+  if (meta.options.lockdown) {
     return false;
   }
 
@@ -55,13 +70,12 @@ function shouldIndexForSearch(meta: Meta, document: Document): boolean {
  */
 function shouldSampleDocument(): boolean {
   // Get sample rate from environment (default 10% for safe rollout)
-  const sampleRateStr = process.env.SEARCH_INDEX_SAMPLE_RATE || "0.1";
-  const sampleRate = parseFloat(sampleRateStr);
+  const sampleRate = config.SEARCH_INDEX_SAMPLE_RATE;
 
   // Validate sample rate
   if (isNaN(sampleRate) || sampleRate < 0 || sampleRate > 1) {
     _logger.warn("Invalid SEARCH_INDEX_SAMPLE_RATE, using 0.1 (10%)", {
-      value: sampleRateStr,
+      value: sampleRate,
     });
     return Math.random() < 0.1;
   }
@@ -79,8 +93,7 @@ export async function sendDocumentToSearchIndex(
 ): Promise<Document> {
   // Check if search indexing is enabled via the SEARCH_SERVICE_URL
   const searchIndexEnabled =
-    process.env.ENABLE_SEARCH_INDEX === "true" &&
-    process.env.SEARCH_SERVICE_URL;
+    config.ENABLE_SEARCH_INDEX && config.SEARCH_SERVICE_URL;
 
   meta.logger.debug("Sending document to search index", {
     url: meta.url,
@@ -95,7 +108,7 @@ export async function sendDocumentToSearchIndex(
   if (!shouldSampleDocument()) {
     meta.logger.debug("Document not sampled for search indexing", {
       url: meta.url,
-      sampleRate: process.env.SEARCH_INDEX_SAMPLE_RATE || "0.1",
+      sampleRate: config.SEARCH_INDEX_SAMPLE_RATE,
     });
     return document;
   }

@@ -1,7 +1,6 @@
 import "dotenv/config";
-import { shutdownOtel } from "../otel";
-import "./sentry";
-import * as Sentry from "@sentry/node";
+import { config } from "../config";
+import { shutdownTracing } from "../otel";
 import {
   getDeepResearchQueue,
   getGenerateLlmsTxtQueue,
@@ -10,7 +9,7 @@ import {
 import { Job, Queue, Worker } from "bullmq";
 import { logger as _logger } from "../lib/logger";
 import systemMonitor from "./system-monitor";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { configDotenv } from "dotenv";
 import { updateDeepResearch } from "../lib/deep-research/deep-research-redis";
 import { performDeepResearch } from "../lib/deep-research/deep-research-service";
@@ -18,29 +17,35 @@ import { performGenerateLlmsTxt } from "../lib/generate-llmstxt/generate-llmstxt
 import { updateGeneratedLlmsTxt } from "../lib/generate-llmstxt/generate-llmstxt-redis";
 import Express from "express";
 import { robustFetch } from "../scraper/scrapeURL/lib/fetch";
-import { BullMQOtel } from "bullmq-otel";
 import { initializeBlocklist } from "../scraper/WebScraper/utils/blocklist";
 import { initializeEngineForcing } from "../scraper/WebScraper/utils/engine-forcing";
 import { crawlFinishedQueue, NuQJob, scrapeQueue } from "./worker/nuq";
 import { finishCrawlSuper } from "./worker/crawl-logic";
 import { getCrawl } from "../lib/crawl-redis";
+import {
+  processMonitorCheckJob,
+  reconcileRunningMonitorChecks,
+} from "./monitoring/runner";
+import { enqueueDueMonitorChecks } from "./monitoring/scheduler";
+import {
+  consumeMonitorCheckJobs,
+  consumeMonitorSearchCheckJobs,
+} from "./monitoring/queue";
+import { shutdownPubSubLogging } from "./logging/log_job";
 
 configDotenv();
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-const jobLockExtendInterval =
-  Number(process.env.JOB_LOCK_EXTEND_INTERVAL) || 10000;
-const jobLockExtensionTime =
-  Number(process.env.JOB_LOCK_EXTENSION_TIME) || 60000;
+const jobLockExtendInterval = config.JOB_LOCK_EXTEND_INTERVAL;
+const jobLockExtensionTime = config.JOB_LOCK_EXTENSION_TIME;
 
-const cantAcceptConnectionInterval =
-  Number(process.env.CANT_ACCEPT_CONNECTION_INTERVAL) || 2000;
-const connectionMonitorInterval =
-  Number(process.env.CONNECTION_MONITOR_INTERVAL) || 10;
-const gotJobInterval = Number(process.env.CONNECTION_MONITOR_INTERVAL) || 20;
+const cantAcceptConnectionInterval = config.CANT_ACCEPT_CONNECTION_INTERVAL;
+const connectionMonitorInterval = config.CONNECTION_MONITOR_INTERVAL;
+const gotJobInterval = config.CONNECTION_MONITOR_INTERVAL;
 
 const runningJobs: Set<string> = new Set();
+let monitorSchedulerInterval: NodeJS.Timeout | null = null;
 
 const processDeepResearchJobInternal = async (
   token: string,
@@ -70,21 +75,19 @@ const processDeepResearchJobInternal = async (
       query: job.data.request.query,
       maxDepth: job.data.request.maxDepth,
       timeLimit: job.data.request.timeLimit,
-      subId: job.data.subId,
       maxUrls: job.data.request.maxUrls,
       analysisPrompt: job.data.request.analysisPrompt,
       systemPrompt: job.data.request.systemPrompt,
       formats: job.data.request.formats,
       jsonOptions: job.data.request.jsonOptions,
       apiKeyId: job.data.apiKeyId,
+      externalRequestId: job.data.externalRequestId ?? null,
     });
 
     if (result.success) {
-      // Move job to completed state in Redis and update research status
       await job.moveToCompleted(result, token, false);
       return result;
     } else {
-      // If the deep research failed but didn't throw an error
       const error = new Error("Deep research failed without specific error");
       await updateDeepResearch(job.data.researchId, {
         status: "failed",
@@ -97,14 +100,7 @@ const processDeepResearchJobInternal = async (
   } catch (error) {
     logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
 
-    Sentry.captureException(error, {
-      data: {
-        job: job.id,
-      },
-    });
-
     try {
-      // Move job to failed state in Redis
       await job.moveToFailed(error, token, false);
     } catch (e) {
       logger.error("Failed to move job to failed state in Redis", { error });
@@ -145,9 +141,9 @@ const processGenerateLlmsTxtJobInternal = async (
       url: job.data.request.url,
       maxUrls: job.data.request.maxUrls,
       showFullText: job.data.request.showFullText,
-      subId: job.data.subId,
       cache: job.data.request.cache,
       apiKeyId: job.data.apiKeyId,
+      externalRequestId: job.data.externalRequestId ?? null,
     });
 
     if (result.success) {
@@ -171,12 +167,6 @@ const processGenerateLlmsTxtJobInternal = async (
     }
   } catch (error) {
     logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
-
-    Sentry.captureException(error, {
-      data: {
-        job: job.id,
-      },
-    });
 
     try {
       await job.moveToFailed(error, token, false);
@@ -228,15 +218,17 @@ async function processFinishCrawlJobInternal(_job: NuQJob) {
 let isShuttingDown = false;
 let isWorkerStalled = false;
 
-process.on("SIGINT", () => {
-  _logger.debug("Received SIGINT. Shutting down gracefully...");
-  isShuttingDown = true;
-});
+if (require.main === module) {
+  process.on("SIGINT", () => {
+    _logger.debug("Received SIGINT. Shutting down gracefully...");
+    isShuttingDown = true;
+  });
 
-process.on("SIGTERM", () => {
-  _logger.debug("Received SIGTERM. Shutting down gracefully...");
-  isShuttingDown = true;
-});
+  process.on("SIGTERM", () => {
+    _logger.debug("Received SIGTERM. Shutting down gracefully...");
+    isShuttingDown = true;
+  });
+}
 
 let cantAcceptConnectionCount = 0;
 
@@ -248,10 +240,9 @@ const workerFun = async (
 
   const worker = new Worker(queue.name, null, {
     connection: getRedisConnection(),
-    lockDuration: 60 * 1000, // 60 seconds
-    stalledInterval: 60 * 1000, // 60 seconds
-    maxStalledCount: 10, // 10 times
-    telemetry: new BullMQOtel("firecrawl-bullmq"),
+    lockDuration: 60 * 1000,
+    stalledInterval: 60 * 1000,
+    maxStalledCount: 10,
   });
 
   worker.startStalledCheckTimer();
@@ -263,7 +254,7 @@ const workerFun = async (
       _logger.info("No longer accepting new jobs. SIGINT");
       break;
     }
-    const token = uuidv4();
+    const token = uuidv7();
     const canAcceptConnection = await monitor.acceptConnection();
     if (!canAcceptConnection) {
       console.log("Can't accept connection due to RAM/CPU load");
@@ -279,7 +270,7 @@ const workerFun = async (
         });
       }
 
-      await sleep(cantAcceptConnectionInterval); // more sleep
+      await sleep(cantAcceptConnectionInterval);
       continue;
     } else if (!currentLiveness) {
       logger.info("Not accepting jobs because the liveness check failed");
@@ -323,7 +314,7 @@ const crawlFinishWorker = async () => {
     if (job === null) {
       __logger.info("No jobs to process", { module: "nuq/metrics" });
       await new Promise(resolve => setTimeout(resolve, noJobTimeout));
-      if (!process.env.NUQ_RABBITMQ_URL) {
+      if (!config.NUQ_RABBITMQ_URL) {
         noJobTimeout = Math.min(noJobTimeout * 2, 10000);
       }
       continue;
@@ -396,18 +387,17 @@ const crawlFinishWorker = async () => {
   }
 };
 
-// Start all workers
 const app = Express();
 
 let currentLiveness: boolean = true;
 
 app.get("/liveness", (req, res) => {
   _logger.info("Liveness endpoint hit");
-  if (process.env.USE_DB_AUTHENTICATION === "true") {
+  if (config.USE_DB_AUTHENTICATION && config.NUQ_RABBITMQ_URL) {
     // networking check for Kubernetes environments
-    const host = process.env.FIRECRAWL_APP_HOST || "firecrawl-app-service";
-    const port = process.env.FIRECRAWL_APP_PORT || "3002";
-    const scheme = process.env.FIRECRAWL_APP_SCHEME || "http";
+    const host = config.FIRECRAWL_APP_HOST;
+    const port = config.FIRECRAWL_APP_PORT;
+    const scheme = config.FIRECRAWL_APP_SCHEME;
 
     robustFetch({
       url: `${scheme}://${host}:${port}`,
@@ -433,8 +423,16 @@ app.get("/liveness", (req, res) => {
   }
 });
 
-const workerPort = process.env.WORKER_PORT || process.env.PORT || 3005;
-app.listen(workerPort, () => {
+const workerPort = config.WORKER_PORT || config.PORT;
+app.listen(workerPort, (error?: Error) => {
+  if (error) {
+    _logger.error("Failed to start liveness endpoint", {
+      error,
+      port: workerPort,
+    });
+    throw error;
+  }
+
   _logger.info(`Liveness endpoint is running on port ${workerPort}`);
 });
 
@@ -446,11 +444,46 @@ app.listen(workerPort, () => {
 
   initializeEngineForcing();
 
+  if (config.USE_DB_AUTHENTICATION && !config.DISABLE_MONITORING) {
+    monitorSchedulerInterval = setInterval(() => {
+      enqueueDueMonitorChecks().catch(error => {
+        _logger.error("Failed to enqueue due monitor checks", { error });
+      });
+      reconcileRunningMonitorChecks().catch(error => {
+        _logger.error("Failed to reconcile running monitor checks", { error });
+      });
+    }, 60_000);
+    enqueueDueMonitorChecks().catch(error => {
+      _logger.error("Failed to enqueue due monitor checks", { error });
+    });
+    reconcileRunningMonitorChecks().catch(error => {
+      _logger.error("Failed to reconcile running monitor checks", { error });
+    });
+
+    // Search checks drain on their own consumer so they can't starve the rest.
+    await Promise.all([
+      consumeMonitorCheckJobs(processMonitorCheckJob),
+      consumeMonitorSearchCheckJobs(processMonitorCheckJob),
+    ]);
+  } else if (!config.USE_DB_AUTHENTICATION) {
+    _logger.info(
+      "Skipping monitor worker startup because database authentication is disabled",
+    );
+  } else {
+    _logger.info(
+      "Skipping monitor worker startup because NUQ_RABBITMQ_URL is not configured",
+    );
+  }
+
   await Promise.all([
     workerFun(getDeepResearchQueue(), processDeepResearchJobInternal),
     workerFun(getGenerateLlmsTxtQueue(), processGenerateLlmsTxtJobInternal),
     crawlFinishWorker(),
   ]);
+
+  if (monitorSchedulerInterval) {
+    clearInterval(monitorSchedulerInterval);
+  }
 
   _logger.info("All workers exited. Waiting for all jobs to finish...");
 
@@ -459,8 +492,7 @@ app.listen(workerPort, () => {
   }
 
   _logger.info("All jobs finished. Shutting down...");
-  shutdownOtel().finally(() => {
-    _logger.debug("OTEL shutdown");
-    process.exit(0);
-  });
+  await shutdownPubSubLogging();
+  await shutdownTracing();
+  process.exit(0);
 })();

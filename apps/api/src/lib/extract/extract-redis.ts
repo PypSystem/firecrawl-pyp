@@ -8,7 +8,6 @@ export enum ExtractStep {
   MAP_RERANK = "map-rerank",
   MULTI_ENTITY = "multi-entity",
   MULTI_ENTITY_SCRAPE = "multi-entity-scrape",
-  MULTI_ENTITY_AGENT_SCRAPE = "multi-entity-agent-scrape",
   MULTI_ENTITY_EXTRACT = "multi-entity-extract",
   SCRAPE = "scrape",
   EXTRACT = "extract",
@@ -40,6 +39,7 @@ type StoredExtract = {
   };
   sessionIds?: string[];
   tokensBilled?: number;
+  creditsBilled?: number;
   zeroDataRetention?: boolean;
 };
 
@@ -68,8 +68,9 @@ export async function saveExtract(id: string, extract: StoredExtract) {
   await redisEvictConnection.set(
     "extract:" + id,
     JSON.stringify(minimalExtract),
+    "EX",
+    EXTRACT_TTL,
   );
-  await redisEvictConnection.expire("extract:" + id, EXTRACT_TTL);
 }
 
 export async function getExtract(id: string): Promise<StoredExtract | null> {
@@ -130,8 +131,9 @@ export async function updateExtract(
   await redisEvictConnection.set(
     "extract:" + id,
     JSON.stringify(minimalExtract),
+    "EX",
+    EXTRACT_TTL,
   );
-  await redisEvictConnection.expire("extract:" + id, EXTRACT_TTL);
 }
 
 export async function getExtractExpiry(id: string): Promise<Date> {
@@ -140,4 +142,25 @@ export async function getExtractExpiry(id: string): Promise<Date> {
   d.setMilliseconds(d.getMilliseconds() + ttl);
   d.setMilliseconds(0);
   return d;
+}
+
+// Result data storage (fallback when GCS is not configured)
+const EXTRACT_RESULT_TTL = 24 * 60 * 60; // 24 hours
+
+export async function saveExtractResult(
+  id: string,
+  result: any,
+): Promise<void> {
+  _logger.debug("Saving extract result " + id + " to Redis...");
+  await redisEvictConnection.set(
+    "extract_result:" + id,
+    JSON.stringify(result),
+    "EX",
+    EXTRACT_RESULT_TTL,
+  );
+}
+
+export async function getExtractResult(id: string): Promise<any | null> {
+  const x = await redisEvictConnection.get("extract_result:" + id);
+  return x ? JSON.parse(x) : null;
 }

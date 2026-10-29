@@ -1,21 +1,24 @@
 import { Queue } from "bullmq";
+import { config } from "../config";
 import { logger } from "../lib/logger";
 import IORedis from "ioredis";
-import { BullMQOtel } from "bullmq-otel";
 import type { DeepResearchServiceOptions } from "../lib/deep-research/deep-research-service";
+import { addExtractJob, ExtractJobData } from "./extract-queue";
+import type { BillTeamJobData } from "./billing/types";
+import type { TrackParams } from "./autumn/types";
 
-let extractQueue: Queue;
 let loggingQueue: Queue;
 let indexQueue: Queue;
 let deepResearchQueue: Queue;
 let generateLlmsTxtQueue: Queue;
-let billingQueue: Queue;
+let billingQueue: Queue<BillTeamJobData>;
 let precrawlQueue: Queue;
+let firebillTrackRetryQueue: Queue<FirebillTrackRetryJobData>;
 let redisConnection: IORedis;
 
 export function getRedisConnection(): IORedis {
   if (!redisConnection) {
-    redisConnection = new IORedis(process.env.REDIS_URL!, {
+    redisConnection = new IORedis(config.REDIS_URL!, {
       maxRetriesPerRequest: null,
     });
     redisConnection.on("connect", () => logger.info("Redis connected"));
@@ -25,28 +28,22 @@ export function getRedisConnection(): IORedis {
   return redisConnection;
 }
 
-const extractQueueName = "{extractQueue}";
 const generateLlmsTxtQueueName = "{generateLlmsTxtQueue}";
 const deepResearchQueueName = "{deepResearchQueue}";
 const billingQueueName = "{billingQueue}";
 export const precrawlQueueName = "{precrawlQueue}";
+const firebillTrackRetryQueueName = "{firebillTrackRetryQueue}";
 
-export function getExtractQueue() {
-  if (!extractQueue) {
-    extractQueue = new Queue(extractQueueName, {
-      connection: getRedisConnection(),
-      defaultJobOptions: {
-        removeOnComplete: {
-          age: 90000, // 25 hours
-        },
-        removeOnFail: {
-          age: 90000, // 25 hours
-        },
-      },
-      telemetry: new BullMQOtel("firecrawl-bullmq"),
-    });
-  }
-  return extractQueue;
+/** A usage event firebill never confirmed, re-sent as the identical event. */
+export type FirebillTrackRetryJobData = TrackParams & {
+  idempotencyKey: string;
+};
+
+export async function addExtractJobToQueue(
+  extractId: string,
+  data: ExtractJobData,
+): Promise<void> {
+  await addExtractJob(extractId, data);
 }
 
 export function getGenerateLlmsTxtQueue() {
@@ -61,7 +58,6 @@ export function getGenerateLlmsTxtQueue() {
           age: 90000, // 25 hours
         },
       },
-      telemetry: new BullMQOtel("firecrawl-bullmq"),
     });
   }
   return generateLlmsTxtQueue;
@@ -81,7 +77,6 @@ export function getDeepResearchQueue() {
             age: 90000, // 25 hours
           },
         },
-        telemetry: new BullMQOtel("firecrawl-bullmq"),
       },
     );
   }
@@ -90,7 +85,7 @@ export function getDeepResearchQueue() {
 
 export function getBillingQueue() {
   if (!billingQueue) {
-    billingQueue = new Queue(billingQueueName, {
+    billingQueue = new Queue<BillTeamJobData>(billingQueueName, {
       connection: getRedisConnection(),
       defaultJobOptions: {
         removeOnComplete: {
@@ -100,10 +95,31 @@ export function getBillingQueue() {
           age: 3600, // 1 hour
         },
       },
-      telemetry: new BullMQOtel("firecrawl-bullmq"),
     });
   }
   return billingQueue;
+}
+
+export function getFirebillTrackRetryQueue() {
+  if (!firebillTrackRetryQueue) {
+    firebillTrackRetryQueue = new Queue<FirebillTrackRetryJobData>(
+      firebillTrackRetryQueueName,
+      {
+        connection: getRedisConnection(),
+        defaultJobOptions: {
+          removeOnComplete: {
+            age: 60 * 60, // 1 hour
+          },
+          // Exhausted retries stay inspectable for a week: each one is an
+          // event that may not have been billed.
+          removeOnFail: {
+            age: 7 * 24 * 60 * 60, // 7 days
+          },
+        },
+      },
+    );
+  }
+  return firebillTrackRetryQueue;
 }
 
 export function getPrecrawlQueue() {
@@ -118,7 +134,6 @@ export function getPrecrawlQueue() {
           age: 24 * 60 * 60, // 1 day
         },
       },
-      telemetry: new BullMQOtel("firecrawl-bullmq"),
     });
   }
   return precrawlQueue;

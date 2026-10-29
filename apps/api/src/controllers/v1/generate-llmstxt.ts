@@ -1,3 +1,4 @@
+import { v7 as uuidv7 } from "uuid";
 import { Response } from "express";
 import {
   ErrorResponse,
@@ -6,8 +7,10 @@ import {
   RequestWithAuth,
 } from "./types";
 import { getGenerateLlmsTxtQueue } from "../../services/queue-service";
-import * as Sentry from "@sentry/node";
 import { saveGeneratedLlmsTxt } from "../../lib/generate-llmstxt/generate-llmstxt-redis";
+import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 type GenerateLLMsTextResponse =
   | ErrorResponse
@@ -26,7 +29,7 @@ export async function generateLLMsTextController(
   req: RequestWithAuth<{}, GenerateLLMsTextResponse, GenerateLLMsTextRequest>,
   res: Response<GenerateLLMsTextResponse>,
 ) {
-  if (req.acuc?.flags?.forceZDR) {
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
     return res.status(400).json({
       success: false,
       error:
@@ -36,12 +39,25 @@ export async function generateLLMsTextController(
 
   req.body = generateLLMsTextRequestSchema.parse(req.body);
 
-  const generationId = crypto.randomUUID();
+  const generationId = uuidv7();
+
+  await logRequest({
+    id: generationId,
+    kind: "llmstxt",
+    api_version: "v1",
+    external_request_id: externalRequestId(req),
+    team_id: req.auth.team_id,
+    origin: "api", // no origin field for llmstxt
+    target_hint: req.body.url,
+    zeroDataRetention: false, // not supported for llmstxt
+    api_key_id: req.acuc?.api_key_id ?? null,
+  });
+
   const jobData = {
     request: req.body,
     teamId: req.auth.team_id,
-    subId: req.acuc?.sub_id ?? undefined,
     apiKeyId: req.acuc?.api_key_id ?? null,
+    externalRequestId: externalRequestId(req),
     generationId,
   };
 
