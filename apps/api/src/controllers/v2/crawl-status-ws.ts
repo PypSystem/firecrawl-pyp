@@ -8,18 +8,18 @@ import {
   RequestWithAuth,
 } from "./types";
 import { WebSocket } from "ws";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { logger } from "../../lib/logger";
 import {
   getCrawl,
+  getCrawlError,
   getCrawlExpiry,
   getCrawlJobs,
   getDoneJobsOrdered,
 } from "../../lib/crawl-redis";
 import { getJobs, PseudoJob } from "./crawl-status";
-import * as Sentry from "@sentry/node";
 import { getConcurrencyLimitedJobs } from "../../lib/concurrency-limit";
-import { scrapeQueue, NuQJobStatus } from "../../services/worker/nuq";
+import { scrapeQueue, NuQJobStatus } from "../../services/worker/nuq-router";
 import { getErrorContactMessage } from "../../lib/deployment";
 
 type ErrorMessage = {
@@ -139,17 +139,42 @@ async function crawlStatusWS(
     }
   }
 
-  const status: Exclude<CrawlStatusResponse, ErrorResponse>["status"] =
+  // Check if the crawl failed during kickoff (e.g. queue full)
+  const crawlError = await getCrawlError(req.params.jobId);
+
+  let status: Exclude<CrawlStatusResponse, ErrorResponse>["status"] =
     sc.cancelled
       ? "cancelled"
       : validJobStatuses.every(x => x[1] === "completed")
         ? "completed"
         : "scraping";
 
+  if (crawlError && jobIDs.length === 0 && status === "completed") {
+    status = "failed";
+  }
+
   jobIDs = validJobIDs; // Use validJobIDs instead of jobIDs for further processing
 
   const doneJobs = await getJobs(doneJobIDs, logger);
   const data = doneJobs.map(x => x.returnvalue);
+
+  if (status === "failed" && crawlError) {
+    await send(ws, {
+      type: "catchup",
+      data: {
+        success: false,
+        error: crawlError,
+        status: "failed",
+        total: 0,
+        completed: 0,
+        creditsUsed: 0,
+        expiresAt: (await getCrawlExpiry(req.params.jobId)).toISOString(),
+        data: [],
+      },
+    });
+    finished = true;
+    return close(ws, 1000, { type: "done" });
+  }
 
   await send(ws, {
     type: "catchup",
@@ -185,15 +210,13 @@ export async function crawlStatusWSController(
       });
     }
 
-    const { team_id } = auth;
+    const { team_id, org_id } = auth;
 
-    req.auth = { team_id };
+    req.auth = { team_id, org_id };
 
     await crawlStatusWS(ws, req);
   } catch (err) {
-    Sentry.captureException(err);
-
-    const id = uuidv4();
+    const id = uuidv7();
     let verbose = JSON.stringify(err);
     if (verbose === "{}") {
       if (err instanceof Error) {

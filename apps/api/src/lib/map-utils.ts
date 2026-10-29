@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import {
   TeamFlags,
   MapDocument,
@@ -7,10 +7,13 @@ import {
   MAX_MAP_LIMIT,
 } from "../controllers/v2/types";
 import { crawlToCrawler, StoredCrawl } from "./crawl-redis";
+import { getScrapeZDR } from "./zdr-helpers";
+import { resolveSafeMode } from "./safe-mode";
 import {
   checkAndUpdateURLForMap,
   isSameDomain,
   isSameSubdomain,
+  resolveRedirects,
 } from "./validateUrl";
 import { fireEngineMap } from "../search/fireEngine";
 import { redisEvictConnection } from "../services/redis";
@@ -23,7 +26,7 @@ import { performCosineSimilarityV2 } from "./map-cosine";
 import { Logger } from "winston";
 
 // Max Links that "Smart /map" can return
-const MAX_FIRE_ENGINE_RESULTS = 500;
+const MAX_FIRE_ENGINE_RESULTS = 100;
 
 export interface MapResult {
   success: boolean;
@@ -48,7 +51,7 @@ function dedupeMapDocumentArray(documents: MapDocument[]): MapDocument[] {
   return Array.from(urlMap.values());
 }
 
-async function queryIndex(
+export async function queryIndex(
   url: string,
   limit: number,
   useIndex: boolean,
@@ -84,13 +87,17 @@ export async function getMapResults({
   includeSubdomains = true,
   crawlerOptions = {},
   teamId,
+  orgId,
   allowExternalLinks,
   abort = new AbortController().signal,
   filterByPath = true,
   flags,
   useIndex = true,
+  ignoreCache = false,
   location,
+  headers,
   maxFireEngineResults = MAX_FIRE_ENGINE_RESULTS,
+  id: providedId,
 }: {
   url: string;
   search?: string;
@@ -98,6 +105,7 @@ export async function getMapResults({
   includeSubdomains?: boolean;
   crawlerOptions?: any;
   teamId: string;
+  orgId?: string | null;
   origin?: string;
   includeMetadata?: boolean;
   allowExternalLinks?: boolean;
@@ -106,14 +114,37 @@ export async function getMapResults({
   filterByPath?: boolean;
   flags: TeamFlags | null;
   useIndex?: boolean;
+  ignoreCache?: boolean;
   location?: ScrapeOptions["location"];
+  headers?: Record<string, string>;
   maxFireEngineResults?: number;
+  id?: string;
 }): Promise<MapResult> {
   const functionStartTime = Date.now();
 
-  const id = uuidv4();
+  // Safe Mode lockdown: serve links from the index only — skip live search +
+  // sitemap discovery. Derived here from the team flags so every caller
+  // (map, extract, llmstxt, prompt enhancement) honors it.
+  const indexOnly =
+    resolveSafeMode(flags, undefined, url).safeMode?.lockdown === true;
+
+  // Under lockdown (index-only) resolving redirects would HEAD/GET the target,
+  // which the zero-outbound guarantee forbids — use the URL as given.
+  const resolvedUrl = indexOnly ? url : await resolveRedirects(url, abort);
+
+  // If the resolved URL is on a different domain, replace the hostname
+  if (!isSameDomain(url, resolvedUrl)) {
+    const urlObj = new URL(url);
+    urlObj.hostname = new URL(resolvedUrl).hostname;
+
+    url = urlObj.toString();
+  }
+
+  const id = providedId ?? uuidv7();
   let mapResults: MapDocument[] = [];
-  const zeroDataRetention = flags?.forceZDR ?? false;
+  // Lockdown (index-only) is cache-only, which implies zero data retention —
+  // and must never write its empty live-search result into the shared cache.
+  const zeroDataRetention = getScrapeZDR(flags) === "forced" || indexOnly;
 
   const sc: StoredCrawl = {
     originUrl: url,
@@ -124,8 +155,9 @@ export async function getMapResults({
     },
     scrapeOptions: scrapeOptions.parse({
       ...(location ? { location } : {}),
+      ...(headers ? { headers } : {}),
     }),
-    internalOptions: { teamId },
+    internalOptions: { teamId, orgId: orgId ?? null },
     team_id: teamId,
     createdAt: Date.now(),
     zeroDataRetention,
@@ -155,11 +187,11 @@ export async function getMapResults({
       crawlerOptions.timeout ?? 30000,
       abort,
       crawlerOptions.useMock,
+      ignoreCache ? 0 : undefined,
     );
 
     if (sitemap > 0) {
       mapResults = mapResults
-        .slice(1)
         .map(x => {
           try {
             return {
@@ -187,32 +219,43 @@ export async function getMapResults({
     );
 
     const cacheKey = `fireEngineMap:${mapUrl}`;
-    const cachedResult = await redisEvictConnection.get(cacheKey);
+    const cachedResult = ignoreCache
+      ? null
+      : await redisEvictConnection.get(cacheKey);
 
-    let pagePromises: (Promise<any> | any)[];
-
-    if (cachedResult) {
-      pagePromises = JSON.parse(cachedResult);
-    } else {
-      const fetchPage = async (page: number) => {
-        return await fireEngineMap(
-          mapUrl,
-          {
-            numResults: resultsPerPage,
-            page: page,
-          },
-          abort,
-        );
-      };
-
-      pagePromises = Array.from({ length: maxPages }, (_, i) =>
-        fetchPage(i + 1),
+    const fetchPage = async (page: number) => {
+      return await fireEngineMap(
+        mapUrl,
+        {
+          numResults: resultsPerPage,
+          page,
+        },
+        abort,
       );
-    }
+    };
+
+    const fetchAllPages = async (): Promise<any[]> => {
+      if (indexOnly) {
+        // Lockdown: no live search discovery, serve from the index only.
+        return [];
+      }
+      if (cachedResult) {
+        return JSON.parse(cachedResult);
+      }
+      // if page 1 has no results, don't fetch remaining pages
+      const page1Result = await fetchPage(1);
+      if (!page1Result || page1Result.length === 0 || maxPages === 1) {
+        return [page1Result];
+      }
+      const remainingPages = await Promise.all(
+        Array.from({ length: maxPages - 1 }, (_, i) => fetchPage(i + 2)),
+      );
+      return [page1Result, ...remainingPages];
+    };
 
     const [indexResults, searchResults] = await Promise.all([
       queryIndex(url, limit, useIndex, includeSubdomains),
-      Promise.all(pagePromises),
+      fetchAllPages(),
     ]);
 
     if (!zeroDataRetention) {
@@ -228,7 +271,7 @@ export async function getMapResults({
       mapResults.push(...indexResults);
     }
 
-    if (crawlerOptions.sitemap === "include") {
+    if (crawlerOptions.sitemap === "include" && !indexOnly) {
       try {
         await crawler.tryGetSitemap(
           urls => {
@@ -242,6 +285,8 @@ export async function getMapResults({
           false,
           crawlerOptions.timeout ?? 30000,
           abort,
+          undefined,
+          ignoreCache ? 0 : undefined,
         );
       } catch (e) {
         // Silently handle sitemap errors
@@ -341,6 +386,7 @@ export async function buildPromptWithWebsiteStructure({
   basePrompt,
   url,
   teamId,
+  orgId,
   flags,
   logger,
   limit = 50,
@@ -352,6 +398,7 @@ export async function buildPromptWithWebsiteStructure({
   basePrompt: string;
   url: string;
   teamId: string;
+  orgId?: string | null;
   flags: TeamFlags | null;
   logger: Logger;
   limit?: number;
@@ -368,6 +415,7 @@ export async function buildPromptWithWebsiteStructure({
       includeSubdomains,
       crawlerOptions: { sitemap: "include" },
       teamId,
+      orgId: orgId ?? null,
       flags,
       allowExternalLinks,
       filterByPath: false,

@@ -1,10 +1,10 @@
 import { logger } from "../../../lib/logger";
-import * as Sentry from "@sentry/node";
+import { config } from "../../../config";
 import { Request, Response } from "express";
 
 export async function checkFireEngine(req: Request, res: Response) {
   try {
-    if (!process.env.FIRE_ENGINE_BETA_URL) {
+    if (!config.FIRE_ENGINE_BETA_URL) {
       logger.warn("Fire engine beta URL not configured");
       return res.status(500).json({
         success: false,
@@ -15,26 +15,26 @@ export async function checkFireEngine(req: Request, res: Response) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
 
-    const urls = ["https://roastmywebsite.ai", "https://example.com"];
+    const urls = [
+      "https://firecrawl-test-site.vercel.app",
+      "https://example.com",
+    ];
     let lastError: any = null;
 
     for (const url of urls) {
       try {
-        const response = await fetch(
-          `${process.env.FIRE_ENGINE_BETA_URL}/scrape`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Disable-Cache": "true",
-            },
-            body: JSON.stringify({
-              url,
-              engine: "chrome-cdp",
-            }),
-            signal: controller.signal,
+        const response = await fetch(`${config.FIRE_ENGINE_BETA_URL}/scrape`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Disable-Cache": "true",
           },
-        );
+          body: JSON.stringify({
+            url,
+            engine: "chrome-cdp",
+          }),
+          signal: controller.signal,
+        });
 
         clearTimeout(timeout);
 
@@ -62,14 +62,12 @@ export async function checkFireEngine(req: Request, res: Response) {
       method: "checkFireEngine",
       error: lastError,
     });
-    Sentry.captureException(lastError);
     return res.status(500).json({
       success: false,
       error: "Internal server error - all retry attempts failed",
     });
   } catch (error) {
     logger.error(error);
-    Sentry.captureException(error);
     return res.status(500).json({
       success: false,
       error: "Internal server error",

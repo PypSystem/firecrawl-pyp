@@ -1520,3 +1520,45 @@ E comente os serviços no `docker-compose.yaml`.
 
 **Documento consolidado para manutenção e operação da API Firecrawl.**
 **Última atualização:** 2025-11-10
+
+---
+
+## 19. Alterações do fork sobre o upstream
+
+O deploy constrói as imagens da API e do Playwright a partir deste repositório (não usa mais
+`ghcr.io/firecrawl/*:latest`), porque o fork mantém uma alteração que o upstream não tem:
+
+**Screenshot pelo engine `playwright`** (usado pelo Studio para ler a identidade visual de
+sites de referência). O upstream removeu esse formato; o fork o mantém em três pontos:
+
+| Arquivo | O que o fork acrescenta |
+|---------|--------------------------|
+| `apps/playwright-service-ts/api.ts` | aceita `screenshot` e `screenshot_full_page`, devolve `screenshot` (PNG em base64) |
+| `apps/api/src/scraper/scrapeURL/engines/playwright/index.ts` | envia as opções ao serviço e devolve o PNG como `data:image/png;base64,...` |
+| `apps/api/src/scraper/scrapeURL/engines/index.ts` | `playwright` declara `screenshot` e `screenshot@fullScreen` como suportados |
+
+Teste: `apps/api/src/__tests__/snips/v2/scrape-screenshot-playwright.test.ts` (roda só com
+`PLAYWRIGHT_MICROSERVICE_URL` definido).
+
+### Atualizar o fork
+
+```bash
+git remote add upstream https://github.com/firecrawl/firecrawl.git   # uma vez
+git fetch upstream main
+git checkout -b chore/atualiza-upstream
+git merge --no-commit --no-ff upstream/main
+```
+
+Em caso de conflito nos três arquivos acima, mantenha a versão do upstream e reaplique as
+alterações da tabela. Antes de ir para `main`, valide na homologação:
+
+```bash
+curl -s -X POST https://<firecrawl-homologa>/v2/scrape -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","formats":["markdown",{"type":"screenshot","fullPage":true}]}'
+```
+
+A resposta deve trazer `data.screenshot` começando com `data:image/png;base64,`.
+
+O `nuq.sql` só é aplicado na criação do volume do Postgres. Mudanças de schema do upstream
+(tabelas, colunas) exigem migração manual no banco existente; índices e ajustes de
+performance novos não são aplicados sozinhos em bancos já criados.

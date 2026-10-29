@@ -1,27 +1,53 @@
-import { v4 as uuidv4 } from "uuid";
-import { NotificationType, RateLimiterMode, ScrapeJobData } from "../types";
+import { v7 as uuidv7 } from "uuid";
+import { NotificationType, ScrapeJobData } from "../types";
 import {
   cleanOldConcurrencyLimitEntries,
   getConcurrencyLimitActiveJobs,
   getConcurrencyQueueJobsCount,
   getCrawlConcurrencyLimitActiveJobs,
+  getTeamQueueLimit,
+  MAX_BACKLOG_TIMEOUT_MS,
   pushConcurrencyLimitActiveJob,
   pushConcurrencyLimitedJob,
+  pushConcurrencyLimitedJobs,
   pushCrawlConcurrencyLimitActiveJob,
+  QueueFullError,
 } from "../lib/concurrency-limit";
 import { logger as _logger } from "../lib/logger";
 import { sendNotificationWithCustomDays } from "./notification/email_notification";
 import { shouldSendConcurrencyLimitNotification } from "./notification/notification-check";
-import { getACUCTeam } from "../controllers/auth";
 import { getJobFromGCS, removeJobFromGCS } from "../lib/gcs-jobs";
 import { Document } from "../controllers/v1/types";
+import { getACUCTeam } from "../controllers/auth";
+import { DEFAULT_TEAM_LIMITS } from "./autumn/autumn.service";
 import { getCrawl } from "../lib/crawl-redis";
 import { Logger } from "winston";
 import { ScrapeJobTimeoutError, TransportableError } from "../lib/error";
 import { deserializeTransportableError } from "../lib/error-serde";
 import { abTestJob } from "./ab-test";
 import { NuQJob, scrapeQueue } from "./worker/nuq";
+import {
+  fdbEnqueueScrapeJobs,
+  resolveJobBackend,
+  scrapeQueue as routedScrapeQueue,
+} from "./worker/nuq-router";
+import {
+  nuqFdbHealthCheck,
+  scrapeQueueFdb,
+  withFdbTimeout,
+} from "./worker/nuq-fdb";
 import { serializeTraceContext } from "../lib/otel-tracer";
+import { isSelfHosted } from "../lib/deployment";
+import { MONITOR_CHECK_STALE_TIMEOUT_MS } from "./monitoring/stale";
+
+// Queue-wait deadline for a backlogged job (how long its owner still cares about the result)
+function backlogTimeoutMs(data: ScrapeJobData): number {
+  if (data.crawl_id) return MAX_BACKLOG_TIMEOUT_MS;
+  if (data.monitoring) return MONITOR_CHECK_STALE_TIMEOUT_MS;
+  if (data.mode === "single_urls")
+    return data.scrapeOptions.timeout ?? 60 * 1000;
+  return 60 * 1000;
+}
 
 /**
  * Checks if a job is a crawl or batch scrape based on its options
@@ -55,12 +81,9 @@ async function _addScrapeJobToConcurrencyQueue(
       ownerId: webScraperOptions.team_id ?? undefined,
       groupId: webScraperOptions.crawl_id ?? undefined,
       backlogged: true,
-      backloggedTimesOutAt: webScraperOptions.crawl_id
-        ? undefined
-        : new Date(
-            Date.now() +
-              (webScraperOptions.scrapeOptions?.timeout ?? 60 * 1000),
-          ),
+      backloggedTimesOutAt: new Date(
+        Date.now() + backlogTimeoutMs(webScraperOptions),
+      ),
     },
   );
 
@@ -72,9 +95,7 @@ async function _addScrapeJobToConcurrencyQueue(
       priority,
       listenable,
     },
-    webScraperOptions.crawl_id
-      ? Infinity
-      : (webScraperOptions.scrapeOptions?.timeout ?? 60 * 1000),
+    backlogTimeoutMs(webScraperOptions),
   );
 }
 
@@ -96,32 +117,76 @@ async function _addScrapeJobsToConcurrencyQueue(
         ownerId: job.data.team_id ?? undefined,
         groupId: job.data.crawl_id ?? undefined,
         backlogged: true,
-        backloggedTimesOutAt: job.data.crawl_id
-          ? undefined
-          : new Date(
-              Date.now() + (job.data.scrapeOptions?.timeout ?? 60 * 1000),
-            ),
+        backloggedTimesOutAt: new Date(Date.now() + backlogTimeoutMs(job.data)),
       },
     })),
   );
 
+  const jobsByTeam = new Map<
+    string,
+    {
+      job: { id: string; data: any; priority: number; listenable: boolean };
+      timeout: number;
+    }[]
+  >();
+
   for (const job of jobs) {
-    await pushConcurrencyLimitedJob(
-      job.data.team_id,
-      {
+    const teamId = job.data.team_id as string;
+    if (!jobsByTeam.has(teamId)) {
+      jobsByTeam.set(teamId, []);
+    }
+    jobsByTeam.get(teamId)!.push({
+      job: {
         id: job.jobId,
         data: job.data,
         priority: job.priority,
         listenable: job.listenable ?? false,
       },
-      job.data.crawl_id
-        ? Infinity
-        : (job.data.scrapeOptions?.timeout ?? 60 * 1000),
-    );
+      timeout: backlogTimeoutMs(job.data),
+    });
+  }
+
+  for (const [teamId, teamJobs] of jobsByTeam) {
+    await pushConcurrencyLimitedJobs(teamId, teamJobs);
   }
 }
 
 export async function _addScrapeJobToBullMQ(
+  webScraperOptions: ScrapeJobData,
+  jobId: string,
+  priority: number = 0,
+  listenable: boolean = false,
+): Promise<NuQJob<ScrapeJobData>> {
+  // direct adds bypass the gates; on the FDB backend that's a slotless enqueue
+  if ((await resolveJobBackend(webScraperOptions)) === "fdb") {
+    if (webScraperOptions.mode === "single_urls") {
+      abTestJob(webScraperOptions);
+    }
+    const { jobs } = await fdbEnqueueScrapeJobs(
+      [
+        {
+          jobId,
+          data: webScraperOptions,
+          priority,
+          listenable,
+          backlogTimeoutMs: backlogTimeoutMs(webScraperOptions),
+        },
+      ],
+      webScraperOptions.team_id,
+      { bypassGate: true },
+    );
+    return jobs[0];
+  }
+
+  return _addScrapeJobToBullMQPg(
+    webScraperOptions,
+    jobId,
+    priority,
+    listenable,
+  );
+}
+
+async function _addScrapeJobToBullMQPg(
   webScraperOptions: ScrapeJobData,
   jobId: string,
   priority: number = 0,
@@ -205,6 +270,82 @@ async function _addScrapeJobsToBullMQ(
   );
 }
 
+async function addScrapeJobFdb(
+  webScraperOptions: ScrapeJobData,
+  jobId: string,
+  priority: number,
+  directToBullMQ: boolean,
+  listenable: boolean,
+): Promise<NuQJob<ScrapeJobData> | null> {
+  if (webScraperOptions.mode === "single_urls") {
+    abTestJob(webScraperOptions);
+  }
+
+  const { jobs, backloggedCount, teamLimit } = await fdbEnqueueScrapeJobs(
+    [
+      {
+        jobId,
+        data: webScraperOptions,
+        priority,
+        listenable,
+        backlogTimeoutMs: backlogTimeoutMs(webScraperOptions),
+      },
+    ],
+    webScraperOptions.team_id,
+    { bypassGate: directToBullMQ },
+  );
+
+  if (backloggedCount > 0) {
+    await maybeSendConcurrencyNotificationFdb(
+      webScraperOptions.team_id,
+      teamLimit,
+      isCrawlOrBatchScrape(webScraperOptions),
+    );
+    // matches the PG contract: null = job waiting in the concurrency queue
+    return null;
+  }
+  return jobs[0];
+}
+
+// parity with the PG path: notify when the backlog exceeds the team limit
+const FDB_OPTIONAL_COUNT_TIMEOUT_MS = 500;
+
+async function maybeSendConcurrencyNotificationFdb(
+  teamId: string,
+  teamLimit: number | null,
+  crawlOrBatch: boolean,
+) {
+  if (teamLimit === null || crawlOrBatch) return;
+  try {
+    if (!(await nuqFdbHealthCheck(FDB_OPTIONAL_COUNT_TIMEOUT_MS))) return;
+    const pending = await withFdbTimeout(
+      scrapeQueueFdb.getTeamPendingCount(teamId),
+      FDB_OPTIONAL_COUNT_TIMEOUT_MS,
+    );
+    if (pending <= teamLimit) return;
+    const shouldSendNotification =
+      await shouldSendConcurrencyLimitNotification(teamId);
+    if (shouldSendNotification) {
+      sendNotificationWithCustomDays(
+        teamId,
+        NotificationType.CONCURRENCY_LIMIT_REACHED,
+        15,
+        false,
+        true,
+      ).catch(error => {
+        _logger.error(
+          "Error sending notification (concurrency limit reached)",
+          {
+            error,
+          },
+        );
+      });
+    }
+  } catch (error) {
+    _logger.warn("Failed to check FDB concurrency notification", { error });
+  }
+}
+
 async function addScrapeJobRaw(
   webScraperOptions: ScrapeJobData,
   jobId: string,
@@ -212,11 +353,26 @@ async function addScrapeJobRaw(
   directToBullMQ: boolean = false,
   listenable: boolean = false,
 ): Promise<NuQJob<ScrapeJobData> | null> {
-  let concurrencyLimited: "yes" | "yes-crawl" | "no" | null = null;
-  let currentActiveConcurrency = 0;
-  let maxConcurrency = 0;
+  if ((await resolveJobBackend(webScraperOptions)) === "fdb") {
+    return addScrapeJobFdb(
+      webScraperOptions,
+      jobId,
+      priority,
+      directToBullMQ,
+      listenable,
+    );
+  }
 
-  if (directToBullMQ) {
+  let concurrencyLimited: "yes" | "yes-crawl" | "no" | null = null;
+  let currentActiveConcurrency: number | null = null;
+  let maxConcurrency = 0;
+  let currentCrawlConcurrency: number | null = null;
+  let maxCrawlConcurrency: number | null = null;
+
+  // Bypass concurrency limits for self-hosted deployments
+  if (isSelfHosted()) {
+    concurrencyLimited = "no";
+  } else if (directToBullMQ) {
     concurrencyLimited = "no";
   } else {
     if (webScraperOptions.crawl_id) {
@@ -229,32 +385,28 @@ async function addScrapeJobRaw(
           : (crawl.maxConcurrency ?? 1);
 
       if (concurrencyLimit !== null) {
-        const crawlConcurrency = (
+        maxCrawlConcurrency = concurrencyLimit;
+        currentCrawlConcurrency = (
           await getCrawlConcurrencyLimitActiveJobs(webScraperOptions.crawl_id)
         ).length;
-        const freeSlots = Math.max(concurrencyLimit - crawlConcurrency, 0);
+        const freeSlots = Math.max(
+          concurrencyLimit - currentCrawlConcurrency,
+          0,
+        );
         if (freeSlots === 0) {
           concurrencyLimited = "yes-crawl";
         }
       }
     }
 
+    maxConcurrency =
+      (await getACUCTeam(webScraperOptions.team_id).catch(() => null))
+        ?.concurrency_limit ?? DEFAULT_TEAM_LIMITS.concurrency_limit;
+
     if (concurrencyLimited === null) {
       const now = Date.now();
-      const maxConcurrency =
-        (
-          await getACUCTeam(
-            webScraperOptions.team_id,
-            false,
-            true,
-            webScraperOptions.mode === "single_urls" &&
-              webScraperOptions.from_extract
-              ? RateLimiterMode.Extract
-              : RateLimiterMode.Crawl,
-          )
-        )?.concurrency ?? 2;
       await cleanOldConcurrencyLimitEntries(webScraperOptions.team_id, now);
-      const currentActiveConcurrency = (
+      currentActiveConcurrency = (
         await getConcurrencyLimitActiveJobs(webScraperOptions.team_id, now)
       ).length;
       concurrencyLimited =
@@ -263,13 +415,39 @@ async function addScrapeJobRaw(
   }
 
   if (concurrencyLimited === "yes" || concurrencyLimited === "yes-crawl") {
+    const concurrencyQueueJobs = await getConcurrencyQueueJobsCount(
+      webScraperOptions.team_id,
+    );
+
+    const queueLimit = getTeamQueueLimit(maxConcurrency);
+    if (concurrencyQueueJobs >= queueLimit) {
+      throw new QueueFullError(concurrencyQueueJobs, queueLimit);
+    }
+
+    if (currentActiveConcurrency === null) {
+      const now = Date.now();
+      await cleanOldConcurrencyLimitEntries(webScraperOptions.team_id, now);
+      currentActiveConcurrency = (
+        await getConcurrencyLimitActiveJobs(webScraperOptions.team_id, now)
+      ).length;
+    }
+
+    _logger.info("Adding scrape job to concurrency queue", {
+      teamId: webScraperOptions.team_id,
+      concurrencyLimitReason:
+        concurrencyLimited === "yes-crawl" ? "crawl" : "team",
+      maxConcurrency,
+      currentConcurrency: currentActiveConcurrency,
+      crawlId: webScraperOptions.crawl_id,
+      maxCrawlConcurrency,
+      currentCrawlConcurrency,
+      jobId,
+    });
+
     if (concurrencyLimited === "yes") {
       // Detect if they hit their concurrent limit
       // If above by 2x, send them an email
       // No need to 2x as if there are more than the max concurrency in the concurrency queue, it is already 2x
-      const concurrencyQueueJobs = await getConcurrencyQueueJobsCount(
-        webScraperOptions.team_id,
-      );
       if (concurrencyQueueJobs > maxConcurrency) {
         // logger.info("Concurrency limited 2x (single) - ", "Concurrency queue jobs: ", concurrencyQueueJobs, "Max concurrency: ", maxConcurrency, "Team ID: ", webScraperOptions.team_id);
 
@@ -305,7 +483,7 @@ async function addScrapeJobRaw(
     );
     return null;
   } else {
-    return await _addScrapeJobToBullMQ(
+    return await _addScrapeJobToBullMQPg(
       webScraperOptions,
       jobId,
       priority,
@@ -316,7 +494,7 @@ async function addScrapeJobRaw(
 
 export async function addScrapeJob(
   webScraperOptions: ScrapeJobData,
-  jobId: string = uuidv4(),
+  jobId: string = uuidv7(),
   priority: number = 0,
   directToBullMQ: boolean = false,
   listenable: boolean = false,
@@ -367,7 +545,49 @@ export async function addScrapeJobs(
     jobsByTeam.get(job.data.team_id)!.push(job);
   }
 
-  for (const [teamId, teamJobs] of jobsByTeam) {
+  for (const [teamId, allTeamJobs] of jobsByTeam) {
+    // jobs can split across backends mid-migration (old crawls drain on PG
+    // while the team's new crawls run on FDB); partition by job backend
+    const backendByJob = new Map<string, "pg" | "fdb">();
+    const backendByCrawl = new Map<string, "pg" | "fdb">();
+    for (const job of allTeamJobs) {
+      const crawlId = job.data.crawl_id;
+      if (crawlId && backendByCrawl.has(crawlId)) {
+        backendByJob.set(job.jobId, backendByCrawl.get(crawlId)!);
+        continue;
+      }
+      const backend = await resolveJobBackend(job.data);
+      backendByJob.set(job.jobId, backend);
+      if (crawlId) backendByCrawl.set(crawlId, backend);
+    }
+
+    const fdbJobs = allTeamJobs.filter(
+      j => backendByJob.get(j.jobId) === "fdb",
+    );
+    if (fdbJobs.length > 0) {
+      const { backloggedCount, teamLimit } = await fdbEnqueueScrapeJobs(
+        fdbJobs.map(job => ({
+          jobId: job.jobId,
+          data: { ...job.data, traceContext },
+          priority: job.priority,
+          listenable: job.listenable,
+          backlogTimeoutMs: backlogTimeoutMs(job.data),
+        })),
+        teamId,
+      );
+      if (backloggedCount > 0) {
+        await maybeSendConcurrencyNotificationFdb(
+          teamId,
+          teamLimit,
+          isCrawlOrBatchScrape(fdbJobs[0].data),
+        );
+      }
+    }
+
+    const teamJobs = allTeamJobs.filter(
+      j => backendByJob.get(j.jobId) === "pg",
+    );
+    if (teamJobs.length === 0) continue;
     // == Buckets for jobs ==
     let jobsForcedToCQ: {
       data: ScrapeJobData;
@@ -400,6 +620,12 @@ export async function addScrapeJobs(
       priority: number;
       listenable?: boolean;
     }[] = [];
+    const crawlConcurrencyLimits: {
+      crawlId: string;
+      maxCrawlConcurrency: number;
+      currentCrawlConcurrency: number;
+      jobsCount: number;
+    }[] = [];
 
     for (const job of teamJobs) {
       if (job.data.crawl_id) {
@@ -426,52 +652,116 @@ export async function addScrapeJobs(
         // All jobs may be in the CQ depending on the global team concurrency limit
         jobsPotentiallyInCQ.push(...crawlJobs);
       } else {
-        const crawlConcurrency = (
+        const currentCrawlConcurrency = (
           await getCrawlConcurrencyLimitActiveJobs(crawlID)
         ).length;
-        const freeSlots = Math.max(concurrencyLimit - crawlConcurrency, 0);
+        const freeSlots = Math.max(
+          concurrencyLimit - currentCrawlConcurrency,
+          0,
+        );
+        const crawlLimitedJobs = crawlJobs.slice(freeSlots);
 
         // The first n jobs may be in the CQ depending on the global team concurrency limit
         jobsPotentiallyInCQ.push(...crawlJobs.slice(0, freeSlots));
 
         // Every job after that must be in the CQ, as the crawl concurrency limit has been reached
-        jobsForcedToCQ.push(...crawlJobs.slice(freeSlots));
+        jobsForcedToCQ.push(...crawlLimitedJobs);
+
+        if (crawlLimitedJobs.length > 0) {
+          crawlConcurrencyLimits.push({
+            crawlId: crawlID,
+            maxCrawlConcurrency: concurrencyLimit,
+            currentCrawlConcurrency,
+            jobsCount: crawlLimitedJobs.length,
+          });
+        }
       }
     }
 
     // All jobs without a crawl ID may be in the CQ depending on the global team concurrency limit
     jobsPotentiallyInCQ.push(...jobsWithoutCrawlID);
 
-    const now = Date.now();
-    const maxConcurrency =
-      (
-        await getACUCTeam(
-          teamId,
-          false,
-          true,
-          jobs[0].data.mode === "single_urls" && jobs[0].data.from_extract
-            ? RateLimiterMode.Extract
-            : RateLimiterMode.Crawl,
-        )
-      )?.concurrency ?? 2;
-    await cleanOldConcurrencyLimitEntries(teamId, now);
+    // Bypass concurrency limits for self-hosted deployments
+    let addToBull: typeof jobsPotentiallyInCQ;
+    let addToCQ: typeof jobsPotentiallyInCQ;
+    let maxConcurrency = 0;
+    let currentActiveConcurrency: number | null = null;
+    let countCanBeDirectlyAdded = 0;
 
-    const currentActiveConcurrency = (
-      await getConcurrencyLimitActiveJobs(teamId, now)
-    ).length;
+    if (isSelfHosted()) {
+      // For self-hosted, add all jobs directly to BullMQ
+      addToBull = jobsPotentiallyInCQ;
+      addToCQ = jobsForcedToCQ;
+    } else {
+      const now = Date.now();
+      maxConcurrency =
+        (await getACUCTeam(teamId).catch(() => null))?.concurrency_limit ??
+        DEFAULT_TEAM_LIMITS.concurrency_limit;
+      await cleanOldConcurrencyLimitEntries(teamId, now);
 
-    const countCanBeDirectlyAdded = Math.max(
-      maxConcurrency - currentActiveConcurrency,
-      0,
-    );
+      currentActiveConcurrency = (
+        await getConcurrencyLimitActiveJobs(teamId, now)
+      ).length;
 
-    const addToBull = jobsPotentiallyInCQ.slice(0, countCanBeDirectlyAdded);
-    const addToCQ = jobsPotentiallyInCQ
-      .slice(countCanBeDirectlyAdded)
-      .concat(jobsForcedToCQ);
+      countCanBeDirectlyAdded = Math.max(
+        maxConcurrency - currentActiveConcurrency,
+        0,
+      );
 
-    // equals 2x the max concurrency
-    if (jobsPotentiallyInCQ.length - countCanBeDirectlyAdded > maxConcurrency) {
+      addToBull = jobsPotentiallyInCQ.slice(0, countCanBeDirectlyAdded);
+      addToCQ = jobsPotentiallyInCQ
+        .slice(countCanBeDirectlyAdded)
+        .concat(jobsForcedToCQ);
+
+      if (addToCQ.length > 0) {
+        const currentQueueSize = await getConcurrencyQueueJobsCount(teamId);
+        const queueLimit = getTeamQueueLimit(maxConcurrency);
+        if (currentQueueSize + addToCQ.length > queueLimit) {
+          throw new QueueFullError(currentQueueSize, queueLimit);
+        }
+      }
+    }
+
+    if (addToCQ.length > 0) {
+      const crawlConcurrencyLimitedJobs = crawlConcurrencyLimits.reduce(
+        (sum, x) => sum + x.jobsCount,
+        0,
+      );
+      const teamConcurrencyLimitedJobs = Math.max(
+        addToCQ.length - crawlConcurrencyLimitedJobs,
+        0,
+      );
+
+      if (currentActiveConcurrency === null) {
+        const now = Date.now();
+        await cleanOldConcurrencyLimitEntries(teamId, now);
+        currentActiveConcurrency = (
+          await getConcurrencyLimitActiveJobs(teamId, now)
+        ).length;
+      }
+
+      _logger.info("Adding scrape jobs to concurrency queue", {
+        teamId,
+        concurrencyLimitReason:
+          teamConcurrencyLimitedJobs > 0 && crawlConcurrencyLimitedJobs > 0
+            ? "team-and-crawl"
+            : crawlConcurrencyLimitedJobs > 0
+              ? "crawl"
+              : "team",
+        maxConcurrency,
+        currentConcurrency: currentActiveConcurrency,
+        jobsCount: addToCQ.length,
+        teamConcurrencyLimitedJobs,
+        crawlConcurrencyLimitedJobs,
+        crawlConcurrencyLimits,
+      });
+    }
+
+    // equals 2x the max concurrency (only check for non-self-hosted)
+    if (
+      !isSelfHosted() &&
+      jobsPotentiallyInCQ.length - countCanBeDirectlyAdded > maxConcurrency
+    ) {
       // logger.info(`Concurrency limited 2x (multiple) - Concurrency queue jobs: ${addToCQ.length} Max concurrency: ${maxConcurrency} Team ID: ${jobs[0].data.team_id}`);
       // Only send notification if it's not a crawl or batch scrape
       if (!isCrawlOrBatchScrape(jobs[0].data)) {
@@ -523,18 +813,19 @@ export async function waitForJob(
   const jobId = typeof job == "string" ? job : job.id;
   const isConcurrencyLimited = !!(typeof job === "string");
 
+  let timeoutHandle: NodeJS.Timeout | null = null;
   let doc: Document | null = null;
   try {
     doc = await Promise.race(
       [
-        scrapeQueue.waitForJob(
+        routedScrapeQueue.waitForJob<Document>(
           jobId,
           timeout !== null ? timeout + 100 : null,
           logger,
         ),
         timeout !== null
           ? new Promise<Document>((_resolve, reject) => {
-              setTimeout(() => {
+              timeoutHandle = setTimeout(() => {
                 reject(
                   new ScrapeJobTimeoutError(
                     "Scrape timed out" +
@@ -561,7 +852,12 @@ export async function waitForJob(
     } else {
       throw e;
     }
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
   }
+
   logger.debug("Got job");
 
   if (!doc) {

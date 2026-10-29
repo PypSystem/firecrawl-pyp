@@ -1,6 +1,6 @@
 import "dotenv/config";
-import "../sentry";
-import * as Sentry from "@sentry/node";
+import { config } from "../../config";
+import { shutdownTracing } from "../../otel";
 import { Job, Queue, Worker } from "bullmq";
 import { logger as _logger, logger } from "../../lib/logger";
 import {
@@ -14,20 +14,21 @@ import {
   queueBillingOperation,
   startBillingBatchProcessing,
 } from "../billing/batch_billing";
+import { resolveBillingMetadata } from "../billing/types";
 import systemMonitor from "../system-monitor";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import {
-  index_supabase_service,
   processIndexInsertJobs,
-  processIndexRFInsertJobs,
   processOMCEJobs,
-  processDomainFrequencyJobs,
   queryDomainsForPrecrawl,
 } from "..";
+import { queryTopUrlsForDomain } from "../../db/rpc";
 import { getSearchIndexClient } from "../../lib/search-index-client";
 // Search indexing is now handled by the separate search service
 // import { processSearchIndexJobs } from "../../lib/search-index/queue";
 import { processWebhookInsertJobs } from "../webhook";
+import { reconcileBrowserSessions } from "../../lib/browser-lifecycle";
+import { processBrowserSessionActivityJobs } from "../../lib/browser-session-activity";
 import {
   scrapeOptions as scrapeOptionsSchema,
   crawlRequestSchema,
@@ -35,24 +36,23 @@ import {
 } from "../../controllers/v2/types";
 import { StoredCrawl, crawlToCrawler, saveCrawl } from "../../lib/crawl-redis";
 import { _addScrapeJobToBullMQ } from "../queue-jobs";
-import { BullMQOtel } from "bullmq-otel";
 import { withSpan, setSpanAttributes } from "../../lib/otel-tracer";
-import { crawlGroup } from "../worker/nuq";
+import { crawlGroup, resolveNewGroupBackend } from "../worker/nuq-router";
 import { getACUCTeam } from "../../controllers/auth";
+import { processEngpickerJob } from "../../lib/engpicker";
+import { logRequest, shutdownPubSubLogging } from "../logging/log_job";
+import { startSiemLoggingConsumer } from "../siem-logging/worker";
+import { closeSiemLoggingTransport } from "../../lib/siem-logging/transport";
+import { requestCreditsShards } from "../../lib/request-credits-store";
 
-const workerLockDuration = Number(process.env.WORKER_LOCK_DURATION) || 60000;
-const workerStalledCheckInterval =
-  Number(process.env.WORKER_STALLED_CHECK_INTERVAL) || 30000;
-const jobLockExtendInterval =
-  Number(process.env.JOB_LOCK_EXTEND_INTERVAL) || 15000;
-const jobLockExtensionTime =
-  Number(process.env.JOB_LOCK_EXTENSION_TIME) || 60000;
+const workerLockDuration = config.WORKER_LOCK_DURATION;
+const workerStalledCheckInterval = config.WORKER_STALLED_CHECK_INTERVAL;
+const jobLockExtendInterval = config.JOB_LOCK_EXTEND_INTERVAL;
+const jobLockExtensionTime = config.JOB_LOCK_EXTENSION_TIME;
 
-const cantAcceptConnectionInterval =
-  Number(process.env.CANT_ACCEPT_CONNECTION_INTERVAL) || 2000;
-const connectionMonitorInterval =
-  Number(process.env.CONNECTION_MONITOR_INTERVAL) || 10;
-const gotJobInterval = Number(process.env.CONNECTION_MONITOR_INTERVAL) || 20;
+const cantAcceptConnectionInterval = config.CANT_ACCEPT_CONNECTION_INTERVAL;
+const connectionMonitorInterval = config.CONNECTION_MONITOR_INTERVAL;
+const gotJobInterval = config.CONNECTION_MONITOR_INTERVAL;
 
 const runningJobs: Set<string> = new Set();
 
@@ -82,8 +82,19 @@ const processBillingJobInternal = async (token: string, job: Job) => {
       await processBillingBatch();
     } else if (job.name === "bill_team") {
       // This is an individual billing operation that should be queued for batch processing
-      const { team_id, subscription_id, credits, is_extract, api_key_id } =
-        job.data;
+      const {
+        team_id,
+        // Undefined on a job enqueued before the producer carried the org;
+        // passed through as such so the batch resolves it once instead.
+        org_id,
+        credits,
+        billing,
+        endpoint,
+        is_extract,
+        api_key_id,
+        autumnTrackInRequest,
+        exchangeAccessEventId,
+      } = job.data;
 
       logger.info(`Adding team ${team_id} billing operation to batch queue`, {
         credits,
@@ -94,10 +105,22 @@ const processBillingJobInternal = async (token: string, job: Job) => {
       // Add to the REDIS batch queue
       await queueBillingOperation(
         team_id,
-        subscription_id,
+        org_id,
         credits,
         api_key_id ?? null,
+        resolveBillingMetadata({
+          billing: billing ?? (endpoint ? { endpoint } : undefined),
+          isExtract: is_extract,
+        }),
         is_extract,
+        autumnTrackInRequest,
+        typeof exchangeAccessEventId === "string" &&
+          exchangeAccessEventId.length > 0
+          ? {
+              accessEventId: exchangeAccessEventId,
+              billingReference: String(job.id),
+            }
+          : undefined,
       );
     } else {
       logger.warn(`Unknown billing job type: ${job.name}`);
@@ -106,7 +129,6 @@ const processBillingJobInternal = async (token: string, job: Job) => {
     await job.moveToCompleted({ success: true }, token, false);
   } catch (error) {
     logger.error("Error processing billing job", { error });
-    Sentry.captureException(error);
     err = error;
     await job.moveToFailed(error, token, false);
   } finally {
@@ -136,19 +158,19 @@ const processPrecrawlJob = async (token: string, job: Job) => {
   // set to true to only run domain precrawl, no individual URLs or crawl jobs
   const DOMAIN_ONLY_RUN = false;
 
-  const MAX_PRE_CRAWL_BUDGET = 10000; // maximum number of pages to precrawl this job
+  const MAX_PRE_CRAWL_BUDGET = 25000; // maximum number of pages to precrawl this job
 
-  const MAX_PRE_CRAWL_DOMAINS = 100; // maximum number of domains to precrawl
-  const MIN_DOMAIN_PRIORITY = 2.0; // minimum priority score to consider a domain
+  const MAX_PRE_CRAWL_DOMAINS = 500; // maximum number of domains to precrawl
+  const MIN_DOMAIN_PRIORITY = 4.0; // minimum priority score to consider a domain
   const MIN_DOMAIN_EVENTS = 1000; // minimum number of events to consider a domain
 
   // number of domain hashes to query in parallel - keep relatively low for now (25 is good)
   const DOMAIN_URL_BATCH_SIZE = 25;
 
   const MIN_URLS_PER_DOMAIN = 10;
-  const MAX_URLS_PER_DOMAIN = 250;
+  const MAX_URLS_PER_DOMAIN = 50;
 
-  const teamId = process.env.PRECRAWL_TEAM_ID;
+  const teamId = config.PRECRAWL_TEAM_ID;
 
   try {
     await withSpan("precrawl.job", async span => {
@@ -257,7 +279,7 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
       type DomainUrlResult = {
         url: string;
-        domain_hash: string;
+        domain_hash: Buffer;
         event_count: number;
         rank: number;
       };
@@ -271,13 +293,16 @@ const processPrecrawlJob = async (token: string, job: Job) => {
         const batch = batches[i];
 
         const batchFutures = batch.map(({ hash, urlsToFetch }) => {
-          return index_supabase_service
-            .rpc("query_top_urls_for_domain", {
-              p_domain_hash: hash,
-              p_time_window: "8 days", // increasing window can significantly slow down the query, modify with caution
-              p_top_n: urlsToFetch,
-            })
-            .overrideTypes<DomainUrlResult[]>();
+          return queryTopUrlsForDomain<DomainUrlResult>(
+            hash,
+            "8 days", // increasing window can significantly slow down the query, modify with caution
+            urlsToFetch,
+          )
+            .then(data => ({ data, error: null }))
+            .catch(error => ({
+              data: null as DomainUrlResult[] | null,
+              error,
+            }));
         });
 
         const startTimeNs = process.hrtime.bigint();
@@ -339,10 +364,11 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
       const bucketedByDomain: Map<string, DomainUrlResult[]> = new Map();
       for (const item of urls) {
-        if (!bucketedByDomain.has(item.domain_hash)) {
-          bucketedByDomain.set(item.domain_hash, []);
+        const key = item.domain_hash.toString("hex");
+        if (!bucketedByDomain.has(key)) {
+          bucketedByDomain.set(key, []);
         }
-        bucketedByDomain.get(item.domain_hash)!.push(item);
+        bucketedByDomain.get(key)!.push(item);
       }
 
       const crawlTargets: Map<
@@ -359,7 +385,9 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
       for (const domain of domains) {
         try {
-          const pages = bucketedByDomain.get(domain.domain_hash);
+          const pages = bucketedByDomain.get(
+            domain.domain_hash.toString("hex"),
+          );
 
           // if this doesn't have any pages, do we want to locate the domain itself and add root only?
           if (!pages || pages.length === 0) {
@@ -449,13 +477,31 @@ const processPrecrawlJob = async (token: string, job: Job) => {
           try {
             const { url, budget: limit } = target;
 
+            const crawlId = uuidv7();
+            await logRequest({
+              id: crawlId,
+              kind: "crawl",
+              api_version: "v2",
+              team_id: teamId,
+              origin: "precrawl",
+              target_hint: url,
+              zeroDataRetention: false,
+              api_key_id: null,
+              creditsShards: requestCreditsShards(limit),
+            });
+
             const crawlerOptions = {
               ...crawlRequestSchema.parse({ url, limit }),
               url: undefined, // unsure why this is needed but leaving for now
               scrapeOptions: undefined, // same here
             };
 
-            const scrapeOptions = scrapeOptionsSchema.parse({});
+            const scrapeOptions = scrapeOptionsSchema.parse({
+              formats: ["rawHtml"],
+              maxAge: 0,
+              storeInCache: true,
+              onlyMainContent: false,
+            });
             const sc: StoredCrawl = {
               originUrl: url,
               crawlerOptions: toV0CrawlerOptions(crawlerOptions),
@@ -463,9 +509,9 @@ const processPrecrawlJob = async (token: string, job: Job) => {
               internalOptions: {
                 disableSmartWaitCache: true, // NOTE: smart wait disabled for crawls to ensure contentful scrape, speed does not matter
                 teamId,
-                saveScrapeResultToGCS:
-                  !!process.env.GCS_FIRE_ENGINE_BUCKET_NAME,
-                zeroDataRetention: true, // is this meant to be true?
+                orgId: null, // internal pre-crawl team, no org applies
+                saveScrapeResultToGCS: !!config.GCS_FIRE_ENGINE_BUCKET_NAME,
+                zeroDataRetention: false,
                 isPreCrawl: true, // NOTE: must be added to internal options for indexing, if not it will be treated as a normal scrape in the index
               },
               team_id: teamId,
@@ -474,24 +520,7 @@ const processPrecrawlJob = async (token: string, job: Job) => {
               zeroDataRetention: false,
             };
 
-            const crawlId = uuidv4();
-
-            // robots disabled for now
-            // const crawler = crawlToCrawler(crawlId, sc, null);
-            // try {
-            //   sc.robots = await crawler.getRobotsTxt(
-            //     scrapeOptions.skipTlsVerification,
-            //   );
-            //   const robotsCrawlDelay = crawler.getRobotsCrawlDelay();
-            //   if (robotsCrawlDelay !== null && !sc.crawlerOptions.delay) {
-            //     sc.crawlerOptions.delay = robotsCrawlDelay;
-            //   }
-            // } catch (e) {
-            //   logger.debug("Failed to get robots.txt (this is probably fine!)", {
-            //     error: e,
-            //   });
-            // }
-
+            sc.queueBackend = await resolveNewGroupBackend(sc.team_id);
             await crawlGroup.addGroup(
               crawlId,
               sc.team_id,
@@ -499,6 +528,11 @@ const processPrecrawlJob = async (token: string, job: Job) => {
                 60 *
                 60 *
                 1000,
+              {
+                backend: sc.queueBackend,
+                maxConcurrency: sc.maxConcurrency,
+                delaySeconds: sc.crawlerOptions?.delay,
+              },
             );
 
             await saveCrawl(crawlId, sc);
@@ -519,13 +553,12 @@ const processPrecrawlJob = async (token: string, job: Job) => {
                 zeroDataRetention: false,
                 apiKeyId: null,
               },
-              crypto.randomUUID(),
+              uuidv7(),
             );
 
             submittedCrawls++;
           } catch (e) {
             logger.error("Error adding precrawl job to queue", { error: e });
-            Sentry.captureException(e);
           }
         }
 
@@ -550,7 +583,6 @@ const processPrecrawlJob = async (token: string, job: Job) => {
     });
   } catch (e) {
     logger.error("Error processing precrawl job", { error: e });
-    Sentry.captureException(e);
     await job.moveToFailed(e, token, false);
   } finally {
     clearInterval(extendLockInterval);
@@ -559,15 +591,29 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
 let isShuttingDown = false;
 
-process.on("SIGINT", () => {
-  logger.info("Received SIGINT. Shutting down gracefully...");
-  isShuttingDown = true;
-});
+// The SIEM consumer is a subscription rather than a loop, so it has to be torn
+// down from the signal path: workerFun exits the process once its own jobs
+// drain, so anything after the worker Promise.all never runs. Unacked batches go
+// back to the broker for another replica.
+function shutdownSiemLoggingTransport(): void {
+  closeSiemLoggingTransport().catch(error => {
+    logger.warn("Failed to close the SIEM logging transport", { error });
+  });
+}
 
-process.on("SIGTERM", () => {
-  logger.info("Received SIGTERM. Shutting down gracefully...");
-  isShuttingDown = true;
-});
+if (require.main === module) {
+  process.on("SIGINT", () => {
+    logger.info("Received SIGINT. Shutting down gracefully...");
+    isShuttingDown = true;
+    shutdownSiemLoggingTransport();
+  });
+
+  process.on("SIGTERM", () => {
+    logger.info("Received SIGTERM. Shutting down gracefully...");
+    isShuttingDown = true;
+    shutdownSiemLoggingTransport();
+  });
+}
 
 let cantAcceptConnectionCount = 0;
 
@@ -583,7 +629,6 @@ const workerFun = async (
     lockDuration: workerLockDuration,
     stalledInterval: workerStalledCheckInterval,
     maxStalledCount: queue.name === precrawlQueueName ? 0 : 10,
-    telemetry: new BullMQOtel("firecrawl-bullmq"),
   });
 
   worker.startStalledCheckTimer();
@@ -596,7 +641,7 @@ const workerFun = async (
       break;
     }
 
-    const token = uuidv4();
+    const token = uuidv7();
     const canAcceptConnection = await monitor.acceptConnection();
 
     if (!canAcceptConnection) {
@@ -643,13 +688,15 @@ const workerFun = async (
     await new Promise(resolve => setTimeout(resolve, 500));
   }
   logger.info("All jobs finished. Worker exiting!");
+  await shutdownPubSubLogging();
+  await shutdownTracing();
   process.exit(0);
 };
 
 const INDEX_INSERT_INTERVAL = 3000;
 const WEBHOOK_INSERT_INTERVAL = 15000;
 const OMCE_INSERT_INTERVAL = 5000;
-const DOMAIN_FREQUENCY_INTERVAL = 10000;
+const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
 // Search indexing is now handled by separate search service, not this worker
 // const SEARCH_INDEX_INTERVAL = 10000;
 
@@ -662,11 +709,16 @@ const DOMAIN_FREQUENCY_INTERVAL = 10000;
     processBillingJobInternal,
   );
 
-  const precrawlWorkerPromise = process.env.PRECRAWL_TEAM_ID
+  const precrawlWorkerPromise = config.PRECRAWL_TEAM_ID
     ? workerFun(getPrecrawlQueue(), processPrecrawlJob)
     : (async () => {
         logger.warn("PRECRAWL_TEAM_ID not set, skipping precrawl worker");
       })();
+  // A RabbitMQ consumer registration, not a polling loop: it returns once
+  // subscribed and the transport reconnects itself on a broker drop.
+  startSiemLoggingConsumer().catch(error => {
+    logger.error("Failed to start the SIEM logging consumer", { error });
+  });
 
   const indexInserterInterval = setInterval(async () => {
     if (isShuttingDown) {
@@ -689,21 +741,14 @@ const DOMAIN_FREQUENCY_INTERVAL = 10000;
     await processWebhookInsertJobs();
   }, WEBHOOK_INSERT_INTERVAL);
 
-  const indexRFInserterInterval = setInterval(async () => {
-    if (isShuttingDown) {
-      return;
-    }
-    await withSpan(
-      "firecrawl-index-worker-process-rf-insert-jobs",
-      async span => {
-        setSpanAttributes(span, {
-          "index.worker.operation": "process_rf_insert_jobs",
-          "index.worker.type": "scheduled",
-        });
-        await processIndexRFInsertJobs();
-      },
-    );
-  }, INDEX_INSERT_INTERVAL);
+  const browserReconcileInterval = setInterval(() => {
+    if (!isShuttingDown) void reconcileBrowserSessions();
+  }, 15_000);
+
+  const browserActivityInterval = setInterval(async () => {
+    if (isShuttingDown) return;
+    await processBrowserSessionActivityJobs();
+  }, BROWSER_ACTIVITY_INSERT_INTERVAL);
 
   const omceInserterInterval = setInterval(async () => {
     if (isShuttingDown) {
@@ -718,21 +763,21 @@ const DOMAIN_FREQUENCY_INTERVAL = 10000;
     });
   }, OMCE_INSERT_INTERVAL);
 
-  const domainFrequencyInterval = setInterval(async () => {
-    if (isShuttingDown) {
+  const engpickerPromise = (async () => {
+    if (config.DISABLE_ENGPICKER) {
+      logger.info("Engpicker is disabled, skipping");
       return;
     }
-    await withSpan(
-      "firecrawl-index-worker-process-domain-frequency-jobs",
-      async span => {
-        setSpanAttributes(span, {
-          "index.worker.operation": "process_domain_frequency_jobs",
-          "index.worker.type": "scheduled",
-        });
-        await processDomainFrequencyJobs();
-      },
-    );
-  }, DOMAIN_FREQUENCY_INTERVAL);
+
+    while (!isShuttingDown) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        await processEngpickerJob();
+      } catch (e) {
+        logger.error("Error processing engpicker job", { error: e });
+      }
+    }
+  })();
 
   // Search indexing is now handled by separate search service
   // The search service has its own worker that processes the queue
@@ -756,13 +801,16 @@ const DOMAIN_FREQUENCY_INTERVAL = 10000;
   }
 
   // Wait for all workers to complete (which should only happen on shutdown)
-  await Promise.all([billingWorkerPromise, precrawlWorkerPromise]);
+  await Promise.all([
+    billingWorkerPromise,
+    precrawlWorkerPromise,
+    engpickerPromise,
+  ]);
 
   clearInterval(indexInserterInterval);
   clearInterval(webhookInserterInterval);
-  clearInterval(indexRFInserterInterval);
+  clearInterval(browserActivityInterval);
+  clearInterval(browserReconcileInterval);
   clearInterval(omceInserterInterval);
-  clearInterval(domainFrequencyInterval);
-
   logger.info("All workers shut down, exiting process");
 })();

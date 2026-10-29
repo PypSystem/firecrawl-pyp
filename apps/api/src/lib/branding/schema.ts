@@ -1,45 +1,63 @@
 import { z } from "zod";
 
-// Schema for LLM output
-export const brandingEnhancementSchema = z.object({
+// Base schema without logoSelection
+const baseBrandingEnhancementSchema = z.object({
   // Button classification - LLM picks which buttons are primary/secondary
-  buttonClassification: z.object({
-    primaryButtonIndex: z
-      .number()
-      .describe(
-        "Index of the primary CTA button in the provided list (0-based), or -1 if none found",
-      ),
-    primaryButtonReasoning: z
-      .string()
-      .describe("Why this button was selected as primary"),
-    secondaryButtonIndex: z
-      .number()
-      .describe(
-        "Index of the secondary button in the provided list (0-based), or -1 if none found",
-      ),
-    secondaryButtonReasoning: z
-      .string()
-      .describe("Why this button was selected as secondary"),
-    confidence: z
-      .number()
-      .min(0)
-      .max(1)
-      .describe("Confidence in button classification (0-1)"),
-  }),
+  buttonClassification: z
+    .object({
+      primaryButtonIndex: z
+        .number()
+        .describe(
+          "REQUIRED: Index of the primary CTA button in the provided list (0-based), or -1 if none found. YOU MUST RETURN THIS FIELD.",
+        ),
+      primaryButtonReasoning: z
+        .string()
+        .describe(
+          "REQUIRED: Why this button was selected as primary. YOU MUST RETURN THIS FIELD.",
+        ),
+      secondaryButtonIndex: z
+        .number()
+        .describe(
+          "REQUIRED: Index of the secondary button in the provided list (0-based), or -1 if none found. YOU MUST RETURN THIS FIELD.",
+        ),
+      secondaryButtonReasoning: z
+        .string()
+        .describe(
+          "REQUIRED: Why this button was selected as secondary. YOU MUST RETURN THIS FIELD.",
+        ),
+      confidence: z
+        .number()
+        .min(0)
+        .max(1)
+        .describe(
+          "REQUIRED: Confidence in button classification (0-1). YOU MUST RETURN THIS FIELD.",
+        ),
+    })
+    .default({
+      primaryButtonIndex: -1,
+      primaryButtonReasoning: "LLM did not return button classification",
+      secondaryButtonIndex: -1,
+      secondaryButtonReasoning: "LLM did not return button classification",
+      confidence: 0,
+    }),
 
   // Color role clarification
   colorRoles: z.object({
-    primaryColor: z.string().nullish().describe("Main brand color (hex)"),
-    accentColor: z.string().nullish().describe("Accent/CTA color (hex)"),
-    backgroundColor: z
+    primaryColor: z.string().describe("Main brand color (hex)"),
+    secondaryColor: z
       .string()
-      .nullish()
-      .describe("Main background color (hex)"),
-    textPrimary: z.string().nullish().describe("Primary text color (hex)"),
+      .optional()
+      .describe(
+        "Secondary brand color (hex) - a complementary color distinct from primary, often used for secondary UI elements, headings, or supporting brand visuals. Omit or return empty string if no clear secondary color exists.",
+      ),
+    accentColor: z.string().describe("Accent/CTA color (hex)"),
+    backgroundColor: z.string().describe("Main background color (hex)"),
+    textPrimary: z.string().describe("Primary text color (hex)"),
     confidence: z.number().min(0).max(1),
   }),
 
-  // Brand personality
+  // Brand personality. Optional: gpt-4o-mini (non-strict mode) often leaves
+  // it out, and failing the whole call over it discarded the colors and fonts.
   personality: z
     .object({
       tone: z
@@ -57,7 +75,7 @@ export const brandingEnhancementSchema = z.object({
     })
     .optional(),
 
-  // Design system insights
+  // Design system insights. Optional for the same reason as personality.
   designSystem: z
     .object({
       framework: z
@@ -72,7 +90,6 @@ export const brandingEnhancementSchema = z.object({
         .describe("Detected CSS framework"),
       componentLibrary: z
         .string()
-        .nullish()
         .describe("Detected component library (e.g., radix-ui, shadcn)"),
     })
     .optional(),
@@ -83,15 +100,62 @@ export const brandingEnhancementSchema = z.object({
       z.object({
         family: z.string().describe("Cleaned, human-readable font name"),
         role: z
-          .enum(["heading", "body", "monospace", "display"])
-          .nullish()
+          .enum(["heading", "body", "monospace", "display", "unknown"])
           .describe("Font role/usage"),
       }),
     )
     .max(5)
     .describe(
       "Top 5 cleaned fonts (remove obfuscation, fallbacks, generics, CSS vars)",
-    ),
+    )
+    .default([]),
 });
 
-export type BrandingEnhancement = z.infer<typeof brandingEnhancementSchema>;
+// Schema with logoSelection (when logo candidates are provided)
+const brandingEnhancementSchemaWithLogo = baseBrandingEnhancementSchema.extend({
+  // Logo selection - LLM picks the best logo from candidates
+  logoSelection: z.object({
+    selectedLogoIndex: z
+      .number()
+      .describe(
+        "REQUIRED: Index of the selected logo in the provided candidates list (0-based), or -1 if NONE of the candidates match the site's brand. Infer the brand from page title/URL when provided (e.g. 'X | Miro' → brand Miro). YOU MUST RETURN A NUMBER.",
+      ),
+    selectedLogoReasoning: z
+      .string()
+      .describe(
+        "REQUIRED: Detailed explanation of why this logo was selected, or why none were suitable if returning -1. YOU MUST PROVIDE REASONING.",
+      ),
+    confidence: z
+      .number()
+      .min(0)
+      .max(1)
+      .describe(
+        "REQUIRED: Confidence in logo selection (0-1). Return 0 if no suitable logo found.",
+      ),
+  }),
+});
+
+// Export function to get the appropriate schema based on whether logo candidates exist
+export function getBrandingEnhancementSchema(hasLogoCandidates: boolean) {
+  return hasLogoCandidates
+    ? brandingEnhancementSchemaWithLogo
+    : baseBrandingEnhancementSchema;
+}
+
+// Type - logoSelection is optional in the type even though it's required in
+// schema when candidates exist. personality/designSystem are optional so the
+// LLM-failure fallback can omit them instead of fabricating values.
+export type BrandingEnhancement = Omit<
+  z.infer<typeof brandingEnhancementSchemaWithLogo>,
+  "logoSelection" | "personality" | "designSystem"
+> & {
+  logoSelection?: z.infer<
+    typeof brandingEnhancementSchemaWithLogo
+  >["logoSelection"];
+  personality?: z.infer<
+    typeof brandingEnhancementSchemaWithLogo
+  >["personality"];
+  designSystem?: z.infer<
+    typeof brandingEnhancementSchemaWithLogo
+  >["designSystem"];
+};

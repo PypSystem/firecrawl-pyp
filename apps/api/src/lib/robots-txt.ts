@@ -3,11 +3,11 @@ import { Logger } from "winston";
 import { ScrapeOptions, scrapeOptions } from "../controllers/v2/types";
 import { scrapeURL } from "../scraper/scrapeURL";
 import { Engine } from "../scraper/scrapeURL/engines";
+import { useFireEngine } from "../scraper/scrapeURL/engines/fire-engine/available";
 import { CostTracking } from "./cost-tracking";
+import { useIndex } from "../services";
 
-const useFireEngine =
-  process.env.FIRE_ENGINE_BETA_URL !== "" &&
-  process.env.FIRE_ENGINE_BETA_URL !== undefined;
+const ROBOTS_MAX_AGE = 1 * 24 * 60 * 60 * 1000;
 
 interface RobotsTxtChecker {
   robotsTxtUrl: string;
@@ -20,10 +20,14 @@ export async function fetchRobotsTxt(
     url,
     zeroDataRetention,
     location,
+    headers,
+    skipCache,
   }: {
     url: string;
     zeroDataRetention: boolean;
     location?: ScrapeOptions["location"];
+    headers?: Record<string, string>;
+    skipCache?: boolean;
   },
   scrapeId: string,
   logger: Logger,
@@ -35,10 +39,14 @@ export async function fetchRobotsTxt(
   const shouldPrioritizeFireEngine = location && useFireEngine;
 
   const forceEngine: Engine[] = [
+    ...(useIndex && !skipCache ? ["index" as const] : []),
     ...(shouldPrioritizeFireEngine
       ? [
           "fire-engine;tlsclient" as const,
           "fire-engine;tlsclient;stealth" as const,
+          // final fallback to chrome-cdp to fill the index
+          "fire-engine;chrome-cdp" as const,
+          "fire-engine;chrome-cdp;stealth" as const,
         ]
       : []),
     "fetch",
@@ -46,6 +54,9 @@ export async function fetchRobotsTxt(
       ? [
           "fire-engine;tlsclient" as const,
           "fire-engine;tlsclient;stealth" as const,
+          // final fallback to chrome-cdp to fill the index
+          "fire-engine;chrome-cdp" as const,
+          "fire-engine;chrome-cdp;stealth" as const,
         ]
       : []),
   ];
@@ -56,12 +67,15 @@ export async function fetchRobotsTxt(
     robotsTxtUrl,
     scrapeOptions.parse({
       formats: ["rawHtml"],
-      timeout: 5000,
+      timeout: 8000,
+      ...(skipCache ? { maxAge: 0 } : { maxAge: ROBOTS_MAX_AGE }),
       ...(location ? { location } : {}),
+      ...(headers ? { headers } : {}),
     }),
     {
       forceEngine,
       v0DisableJsDom: true,
+      orgId: null,
       externalAbort: abort
         ? {
             signal: abort,
@@ -84,6 +98,11 @@ export async function fetchRobotsTxt(
   ) {
     content = response.document.rawHtml!;
   } else {
+    if (response.success && response.document.metadata.statusCode === 404) {
+      logger.warn("Robots.txt not found", { robotsTxtUrl }); // should probably index 404 robots.txt
+      return { content: "", url: robotsTxtUrl };
+    }
+
     logger.error(`Request failed for robots.txt fetch`, {
       method: "fetchRobotsTxt",
       robotsTxtUrl,

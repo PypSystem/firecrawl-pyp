@@ -4,7 +4,6 @@ import {
   getGeneratedLlmsTxt,
   getGeneratedLlmsTxtExpiry,
 } from "../../lib/generate-llmstxt/generate-llmstxt-redis";
-import { supabaseGetJobsById } from "../../lib/supabase-jobs";
 
 export async function generateLLMsTextStatusController(
   req: RequestWithAuth<{ jobId: string }, any, any>,
@@ -13,7 +12,7 @@ export async function generateLLMsTextStatusController(
   const generation = await getGeneratedLlmsTxt(req.params.jobId);
   const showFullText = generation?.showFullText ?? false;
 
-  if (!generation) {
+  if (!generation || generation.team_id !== req.auth.team_id) {
     return res.status(404).json({
       success: false,
       error: "llmsTxt generation job not found",
