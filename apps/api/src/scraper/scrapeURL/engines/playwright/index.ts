@@ -4,10 +4,13 @@ import { EngineScrapeResult } from "..";
 import { Meta } from "../..";
 import { robustFetch } from "../../lib/fetch";
 import { getInnerJson } from "@mendable/firecrawl-rs";
+import { hasFormatOfType } from "../../../../lib/format-utils";
 
 export async function scrapeURLWithPlaywright(
   meta: Meta,
 ): Promise<EngineScrapeResult> {
+  const screenshotFormat = hasFormatOfType(meta.options.formats, "screenshot");
+
   const response = await robustFetch({
     url: config.PLAYWRIGHT_MICROSERVICE_URL!,
     headers: {
@@ -19,6 +22,9 @@ export async function scrapeURLWithPlaywright(
       timeout: meta.abort.scrapeTimeout(),
       headers: meta.options.headers,
       skip_tls_verification: meta.options.skipTlsVerification,
+      screenshot: !!screenshotFormat,
+      screenshot_full_page: screenshotFormat?.fullPage ?? false,
+      screenshot_quality: screenshotFormat?.quality,
     },
     method: "POST",
     logger: meta.logger.child("scrapeURLWithPlaywright/robustFetch"),
@@ -27,6 +33,7 @@ export async function scrapeURLWithPlaywright(
       pageStatusCode: z.number(),
       pageError: z.string().optional(),
       contentType: z.string().optional(),
+      screenshot: z.string().optional(),
       // Optional: older playwright-service builds don't send it.
       url: z.string().optional(),
     }),
@@ -47,6 +54,10 @@ export async function scrapeURLWithPlaywright(
     statusCode: response.pageStatusCode,
     error: response.pageError,
     contentType: response.contentType,
+    // Screenshot is returned as base64 from playwright-service, convert to data URI
+    screenshot: response.screenshot
+      ? `data:image/png;base64,${response.screenshot}`
+      : undefined,
 
     proxyUsed: "basic",
   };

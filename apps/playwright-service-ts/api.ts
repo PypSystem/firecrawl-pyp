@@ -156,6 +156,13 @@ interface UrlModel {
   headers?: { [key: string]: string };
   check_selector?: string;
   skip_tls_verification?: boolean;
+  screenshot?: boolean;
+  screenshot_full_page?: boolean;
+}
+
+interface ScreenshotOptions {
+  enabled: boolean;
+  fullPage: boolean;
 }
 
 let browser: Browser;
@@ -264,6 +271,7 @@ const scrapePage = async (
   timeout: number,
   checkSelector: string | undefined,
   securityState: ContextSecurityState,
+  screenshotOptions?: ScreenshotOptions,
 ) => {
   console.log(
     `Navigating to ${url} with waitUntil: ${waitUntil} and timeout: ${timeout}ms`,
@@ -312,8 +320,20 @@ const scrapePage = async (
     }
   }
 
+  // O Studio lê a identidade visual da referência a partir desta imagem; o upstream
+  // deixou de oferecer o formato, então ele é mantido aqui, no mesmo contexto filtrado.
+  let screenshot: string | undefined = undefined;
+  if (screenshotOptions?.enabled) {
+    const buffer = await page.screenshot({
+      fullPage: screenshotOptions.fullPage,
+      type: 'png',
+    });
+    screenshot = buffer.toString('base64');
+  }
+
   return {
     content,
+    screenshot,
     // Where the returned content came from: page.url() for rendered HTML
     // (covers HTTP 3xx and client-side redirects), response.url() for raw
     // JSON/text bodies, which come from the page.goto response.
@@ -357,6 +377,8 @@ app.post('/scrape', async (req: Request, res: Response) => {
     headers,
     check_selector,
     skip_tls_verification = false,
+    screenshot = false,
+    screenshot_full_page = false,
   }: UrlModel = req.body;
 
   console.log(`================= Scrape Request =================`);
@@ -501,6 +523,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
       timeout,
       check_selector,
       securityState,
+      { enabled: screenshot, fullPage: screenshot_full_page },
     );
     const pageError =
       result.status !== 200 ? getError(result.status) : undefined;
@@ -519,6 +542,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
       contentType: result.contentType,
       url: result.url,
       ...(pageError && { pageError }),
+      ...(result.screenshot && { screenshot: result.screenshot }),
     });
   } catch (error) {
     if (error instanceof InsecureConnectionError) {
